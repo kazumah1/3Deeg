@@ -1,0 +1,8 @@
+/data/
+/.cache/
+/.venv/
+__pycache__/
+*.py[cod]
+*.zip
+*.zip.part
+.DS_Store
