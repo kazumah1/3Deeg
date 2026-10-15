@@ -58,6 +58,13 @@ Confirmed repository facts from the Hugging Face file manifest:
 - Label-to-geometry mapping strips the leading category ID (e.g. `01_airplane_06` → `airplane_06.npy`); all 720 objects map successfully for sub01.
 - Both EEG windows were checked for finite values. No model or additional preprocessing has been run.
 
+## Next experiment: primitive fitting
+
+- A fixed ten-object, geometry-only benchmark subset is prepared by `scripts/prepare_primitive_benchmark.py`. It uses held-out `08` variants from ten distinct categories and writes a manifest plus packed XYZ/RGB arrays under `data/neuro-3d/processed/v1/`.
+- Compare one oriented cuboid, `k` oriented cuboids, a superquadric, Gaussian-mixture ellipsoids, and medial spheres.
+- Primary score: symmetric squared Chamfer distance between equal-count primitive surface samples and original XYZ points. Also report visual comparison, fitting runtime, convergence status, and loss trace.
+- Do not compare methods until component budgets, initialization, seeds, stopping criteria, and surface-sampling count are recorded. This is a geometry-approximation benchmark, not an EEG-decoding experiment.
+
 ## Saved Checkpoint — October 7, 2026
 
 - User reviewed the local EEG/3D explorer and approved its current appearance; work stopped here at their request.
