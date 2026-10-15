@@ -17,6 +17,8 @@ python3 -m venv .venv
 
 Open **http://127.0.0.1:8765**. The initial setup downloads sub01 EEG and all core point clouds (about 814 MB); allow at least 2 GB free. Data is downloaded separately and excluded from Git. No EEG decoding model is running.
 
+The explorer can overlay the fitted PCA-oriented cuboid surface for the prepared ten-object benchmark. Generate or refresh those fits with `.venv/bin/python scripts/benchmark_oriented_cuboids.py --manifest data/neuro-3d/processed/v1/primitive_benchmark_10_objects.csv --output-dir data/neuro-3d/processed/v1/oriented_cuboid_10_object_benchmark`.
+
 ## Dataset setup
 
 **Start exploring:** [interactive EEG and point-cloud walkthrough](EXPLORING.md).
