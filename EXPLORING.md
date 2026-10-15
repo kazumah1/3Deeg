@@ -1,6 +1,6 @@
 # First session: EEG and geometry
 
-Start with one participant and view the ground-truth object alongside its EEG. This establishes what the generator will eventually receive and what it must reconstruct.
+Start with one participant and view the ground-truth object alongside its EEG. This establishes what the generator will eventually receive and what it must reconstruct. The explorer and trial index require Python 3.12+.
 
 ## Start the explorer
 
@@ -18,7 +18,7 @@ The explorer reads source arrays without modifying them. EEG is memory-mapped to
 
 ## Try these steps
 
-1. Start with **airplane**, variant **00**. Drag the point cloud to rotate it, scroll to zoom, and toggle point colors. It contains 8,192 XYZ/RGB points. This is the geometry target for the EEG trials, not a generated prediction.
+1. Start with **airplane**, variant **00**. Drag the point cloud to orbit on pitch and yaw, hold Shift while dragging to roll, scroll to zoom, and toggle point colors. It contains 8,192 XYZ/RGB points. This is the geometry target for the EEG trials, not a generated prediction.
 2. Look at the solid EEG trace, then change **Channel index**. The heatmap shows all 64 channels; each row is centered and scaled by its own standard deviation for display. The trace retains stored amplitudes. Channel indices run from 0 to 63; electrode names and physical units are not yet verified.
 3. Switch **Recording** between repeats. Solid green is the selected trial; dashed orange is the next repeat of that same object. The target object stays fixed while the brain recordings differ. Ask: how much variation must an encoder tolerate?
 4. Switch between **1 second / 250 Hz** and **6 seconds / 100 Hz**. These are separate stored arrays; do not assume one is a crop of the other. Time axes begin at the first stored sample, not a verified stimulus onset.
@@ -34,6 +34,16 @@ Objects ending in `00`–`07` have two repeats; those ending in `08`–`09` have
 
 Keep repeated trials of the same object together when designing evaluation splits. A random trial split would allow the same target object to appear on both sides. The explorer does not create train/test splits or project preprocessing outputs.
 
+## Trial-to-object index
+
+Build the verified, row-per-trial CSV index before creating any split or preprocessing output:
+
+```sh
+.venv/bin/python scripts/build_trial_index.py
+```
+
+This writes `data/neuro-3d/processed/v1/sub01_trial_to_object_index.csv`. Its 1,728 rows map the zero-based EEG trial index to the source label, parsed category and variant, per-object repeat ordinal, matching point-cloud file, and split role. `08` and `09` are marked `test` to mirror the upstream variant holdout; all other variants are marked `train`. The index is local, derived from the immutable extracted labels, and can be rebuilt after a fresh dataset setup. Pass `--participant sub02` or `--data-dir /path/to/neuro-3d` when applicable.
+
 ## Next experiment
 
-After inspecting a few objects, prepare a reproducible trial-to-object index and the object-level split, then establish encoder inputs and checkpoint availability. Inspect encoder embeddings before choosing the first geometry generator. Training an EEG-to-geometry model is a separate step; this session runs no encoder or generator.
+After inspecting a few objects, use the trial-to-object index to establish encoder inputs and checkpoint availability. Inspect encoder embeddings before choosing the first geometry generator. Training an EEG-to-geometry model is a separate step; this session runs no encoder or generator.

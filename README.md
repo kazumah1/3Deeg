@@ -3,7 +3,7 @@ Inspect Neuro-3D / EEG-3D recordings alongside their corresponding 3D objects. T
 
 ## Quick start
 
-Requires Python 3.11+ and curl. From the cloned repository:
+The explorer and trial index require Python 3.12+ and curl. From the cloned repository:
 
 ```sh
 python3 -m venv .venv
@@ -11,6 +11,7 @@ python3 -m venv .venv
 .venv/bin/python scripts/setup_neuro3d.py download
 .venv/bin/python scripts/setup_neuro3d.py extract
 .venv/bin/python scripts/setup_neuro3d.py verify
+.venv/bin/python scripts/build_trial_index.py
 .venv/bin/python scripts/explore_neuro3d.py
 ```
 
@@ -19,6 +20,8 @@ Open **http://127.0.0.1:8765**. The initial setup downloads sub01 EEG and all co
 ## Dataset setup
 
 **Start exploring:** [interactive EEG and point-cloud walkthrough](EXPLORING.md).
+
+**Build the trial-to-object table:** `.venv/bin/python scripts/build_trial_index.py` writes `data/neuro-3d/processed/v1/sub01_trial_to_object_index.csv`, mapping every zero-based EEG trial to its object label, repeat, geometry file, and upstream-compatible train/test role.
 
 **Team handoff:** [Neuro-3D / EEG-3D access instructions and local preprocessing locations](DATASETS.md).
 
