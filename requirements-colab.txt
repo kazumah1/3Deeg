@@ -1,0 +1,4 @@
+# Colab already provides torch, numpy, scipy, pandas, openpyxl, plotly, huggingface_hub.
+einops>=0.8
+diffusers>=0.27
+ninja>=1.11
