@@ -28,7 +28,7 @@ A recognizable target and a plausible EEG trace do not establish that an EEG dec
 
 ## Fitted cuboid overlay
 
-The explorer recognizes the prepared ten-object primitive benchmark. Use the **Primitive benchmark** selector or **Next benchmark object** to move through the held-out `08` objects without manually changing category and variant. Selecting one automatically enables the amber **Fitted cuboid surface** overlay and shows that object's squared Chamfer score beside the trial information. The control is disabled for all other objects, which have no subset cuboid fit. Rebuild the fit with:
+The explorer recognizes the prepared ten-object primitive benchmark. Use the **Primitive benchmark** selector or **Next benchmark object** to move through the held-out `08` objects without manually changing category and variant. Select **1 oriented cuboid** or the precomputed **k=4 oriented cuboids** before enabling the amber **Fitted cuboid surface** overlay. The displayed squared Chamfer score changes with the selected fit. The control is disabled for all other objects, which have no subset cuboid fit. Rebuild the single-cuboid fit with:
 
 ```sh
 .venv/bin/python benchmark/scripts/benchmark_oriented_cuboids.py \

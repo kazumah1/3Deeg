@@ -11,6 +11,26 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 
 
+def load_cuboid_fit(path, kind):
+    if not path.is_file():
+        return {}
+    fitted = np.load(path, allow_pickle=False)
+    metrics = {}
+    metric_path = path.with_name('per_object.csv')
+    if metric_path.is_file():
+        with metric_path.open(newline='', encoding='utf-8') as handle:
+            metrics = {row['label']: dict(chamfer_squared=float(row['chamfer_squared'])) for row in csv.DictReader(handle)}
+    result = {}
+    for index, label in enumerate(fitted['labels']):
+        centers, axes, extents = fitted['centers'][index], fitted['axes'][index], fitted['extents'][index]
+        if centers.ndim == 1:
+            centers, axes, extents = centers[None], axes[None], extents[None]
+        result[str(label)] = dict(kind=kind, k=len(centers), components=[dict(center=center.tolist(), axes=axis.tolist(), extents=extent.tolist())
+                                                                         for center, axis, extent in zip(centers, axes, extents)],
+                                  **metrics.get(str(label), {}))
+    return result
+
+
 class Dataset:
     def __init__(self, root, participant):
         self.root = root / 'extracted'
@@ -30,23 +50,19 @@ class Dataset:
         for window, data in self.eeg.items():
             if data.shape != (len(self.labels), 64, 250 if window == '1s_250Hz' else 600):
                 raise ValueError(f'Unexpected EEG shape: {window}: {data.shape}')
-        self.cuboids = {}
-        cuboid_path = Path(__file__).resolve().parents[1] / 'benchmark/oriented_cuboid/ten_object/fitted_cuboids.npz'
-        if cuboid_path.is_file():
-            fitted = np.load(cuboid_path, allow_pickle=False)
-            metrics = {}
-            metric_path = cuboid_path.with_name('per_object.csv')
-            if metric_path.is_file():
-                with metric_path.open(newline='', encoding='utf-8') as handle:
-                    metrics = {row['label']: dict(chamfer_squared=float(row['chamfer_squared'])) for row in csv.DictReader(handle)}
-            self.cuboids = {str(label): dict(center=fitted['centers'][index].tolist(), axes=fitted['axes'][index].tolist(),
-                                             extents=fitted['extents'][index].tolist(), **metrics.get(str(label), {}))
-                            for index, label in enumerate(fitted['labels'])}
+        benchmark_root = Path(__file__).resolve().parents[1] / 'benchmark'
+        self.cuboid_fits = {
+            'single': load_cuboid_fit(benchmark_root / 'oriented_cuboid/ten_object/fitted_cuboids.npz', 'single'),
+            'k4': load_cuboid_fit(benchmark_root / 'k_oriented_cuboid/k4_ten_object/fitted_cuboids.npz', 'k4'),
+        }
+        self.cuboid_fits = {kind: fits for kind, fits in self.cuboid_fits.items() if fits}
 
     def summary(self):
         return dict(participant=self.participant, trials=len(self.labels), objects=self.objects,
                     categories=len({o['category'] for o in self.objects}),
-                    repeats=dict(Counter(len(o['trials']) for o in self.objects)), benchmark_objects=sorted(self.cuboids))
+                    repeats=dict(Counter(len(o['trials']) for o in self.objects)),
+                    benchmark_objects=sorted(set().union(*[set(fits) for fits in self.cuboid_fits.values()]) if self.cuboid_fits else set()),
+                    available_cuboid_fits=list(self.cuboid_fits))
 
     def sample(self, trial, window):
         if window not in self.eeg or not 0 <= trial < len(self.labels):
@@ -59,10 +75,10 @@ class Dataset:
         return dict(label=label, trial=trial, window=window, hz=250 if window == '1s_250Hz' else 100,
                     points=points.tolist(), eeg=eeg.tolist(), std=float(eeg.std()))
 
-    def cuboid(self, label):
-        if label not in self.cuboids:
-            raise ValueError('No fitted cuboid is available for this object')
-        return dict(label=label, **self.cuboids[label])
+    def cuboid(self, label, kind):
+        if kind not in self.cuboid_fits or label not in self.cuboid_fits[kind]:
+            raise ValueError('No fitted cuboid is available for this object and fit type')
+        return dict(label=label, **self.cuboid_fits[kind][label])
 
 
 def main():
@@ -88,7 +104,7 @@ def main():
                     payload, mime = json.dumps(sample, allow_nan=False).encode(), 'application/json'
                 elif route.path == '/api/cuboid':
                     query = parse_qs(route.query)
-                    payload, mime = json.dumps(dataset.cuboid(query.get('label', [''])[0]), allow_nan=False).encode(), 'application/json'
+                    payload, mime = json.dumps(dataset.cuboid(query.get('label', [''])[0], query.get('kind', ['single'])[0]), allow_nan=False).encode(), 'application/json'
                 else:
                     self.send_error(404)
                     return
