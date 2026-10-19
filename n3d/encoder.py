@@ -54,12 +54,20 @@ def rng_state() -> dict:
 
 
 def restore_rng(ck: dict) -> None:
+    """Restore RNG streams. torch.load(map_location='cuda') moves the saved CPU byte tensors to
+    the GPU, but set_rng_state only accepts CPU ByteTensors, so bring them back first. A
+    failure here only affects which random numbers come next, so warn instead of crashing."""
     r = ck.get("rng")
     if not r:
         return
-    torch.set_rng_state(r["torch"]); np.random.set_state(r["numpy"]); random.setstate(r["python"])
-    if r.get("cuda") and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(r["cuda"])
+    try:
+        torch.set_rng_state(r["torch"].cpu().to(torch.uint8))
+        np.random.set_state(r["numpy"])
+        random.setstate(r["python"])
+        if r.get("cuda") and torch.cuda.is_available() and len(r["cuda"]) == torch.cuda.device_count():
+            torch.cuda.set_rng_state_all([s.cpu().to(torch.uint8) for s in r["cuda"]])
+    except Exception as e:
+        print(f"warning: could not restore RNG state ({type(e).__name__}: {e}); continuing with fresh RNG")
 
 
 def device() -> torch.device:
