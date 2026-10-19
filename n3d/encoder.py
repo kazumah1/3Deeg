@@ -66,7 +66,12 @@ def device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def forward(model, batch, dev, dyn_scale=1.0, stat_scale=1.0):
+ZERO_STREAM = {"dyn_scale": 1.0, "stat_scale": 1.0}  # set by --zero-stream for single-stream encoders
+
+
+def forward(model, batch, dev, dyn_scale=None, stat_scale=None):
+    dyn_scale = ZERO_STREAM["dyn_scale"] if dyn_scale is None else dyn_scale
+    stat_scale = ZERO_STREAM["stat_scale"] if stat_scale is None else stat_scale
     dyn = batch["dyn"].to(dev).float() * dyn_scale
     stat = batch["stat"].to(dev).float() * stat_scale
     f_g, shape_logits, f_a, color_logits = model(dyn, stat)
@@ -130,7 +135,20 @@ def score(e: dict, b: Bundle, eval_objs: np.ndarray, scale: float = 1.0) -> dict
     out["retr_inst_top5"] = topk(inst_logits, pos, 5)
     out["chance_shape_top1"] = 1.0 / len(cats)
     out["chance_inst_top1"] = 1.0 / len(eval_objs)
+    lg = e["shape_logits"] - e["shape_logits"].max(1, keepdims=True)
+    logp = lg - np.log(np.exp(lg).sum(1, keepdims=True))
+    out["shape_nll"] = float(-logp[np.arange(len(e["cat"])), e["cat"]].mean())
+    out |= significance(out, n_classes=e["shape_logits"].shape[1])
     return out
+
+
+def significance(m: dict, n_classes: int) -> dict:
+    """One-sided exact binomial p-values against uniform guessing over all head classes.
+    With 144 test objects one object is 0.7 points, so small differences are noise."""
+    from scipy.stats import binomtest
+    n = m["n"]
+    return {f"p_{k}": float(binomtest(round(m[k] * n), n, kk / n_classes, alternative="greater").pvalue)
+            for k, kk in (("shape_top1", 1), ("shape_top5", 5))}
 
 
 def run_dir(run: str) -> Path:
@@ -156,6 +174,8 @@ def setup(args):
 
 
 def train(args):
+    if args.zero_stream != "none":
+        ZERO_STREAM[f"{args.zero_stream}_scale"] = 0.0
     set_seed(args.seed)
     dev, out_dir = device(), run_dir(args.run)
     b, splits = setup(args)
@@ -174,7 +194,12 @@ def train(args):
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=(args.epochs + 5) * len(loader),
                                                 final_div_factor=10000, pct_start=min(0.3, 2 / args.epochs))
     color_w = torch.tensor(config.COLOR_CLASS_WEIGHTS, device=dev)
-    start, best = 0, -1.0
+    lower_better = args.select.endswith("nll")
+    start, best = 0, (float("inf") if lower_better else -1.0)
+    better = (lambda a, b_: a < b_) if lower_better else (lambda a, b_: a > b_)
+    train_eval_ds = EEG3D(b, splits["train"], train=False)  # repeats averaged, no augmentation
+    if args.restart and (out_dir / "metrics.jsonl").exists():
+        (out_dir / "metrics.jsonl").rename(out_dir / f"metrics.{time.strftime('%Y%m%d-%H%M%S')}.jsonl")
     ck = None if args.restart else load_resume(out_dir, dev)
     if ck is not None:
         if ck.get("epochs", args.epochs) != args.epochs:
@@ -183,7 +208,7 @@ def train(args):
         model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"]); sched.load_state_dict(ck["sched"])
         start, best = ck["epoch"] + 1, ck["best"]
         restore_rng(ck)
-        print(f"resumed at epoch {start} (best {sel_name} retr_cat_top1 {best:.4f})")
+        print(f"resumed at epoch {start} (best {sel_name} {args.select} {best:.4f})")
 
     log = out_dir / "metrics.jsonl"
     for epoch in range(start, args.epochs):
@@ -206,22 +231,29 @@ def train(args):
             rec |= {f"{sel_name}_{k}": v for k, v in sel.items()}
             if sel_name != "test":
                 rec |= {f"test_{k}": v for k, v in score(embed(model, test_ds, dev), b, splits["test"], scale).items()}
-            if sel["retr_cat_top1"] > best:
-                best = sel["retr_cat_top1"]
+            tr = score(embed(model, train_eval_ds, dev), b, splits["train"], scale)
+            rec |= {f"trainset_{k}": tr[k] for k in ("shape_top1", "shape_top5", "retr_cat_top1", "shape_nll")}
+            if better(sel[args.select], best):
+                best = sel[args.select]
                 atomic_save({"model": model.state_dict(), "epoch": epoch, "metrics": rec}, out_dir / "best.pt")
                 rec["saved_best"] = True
-            print(f"ep {epoch:3d} loss {rec['train_loss']:.3f} | {sel_name} shape@1 {sel['shape_top1']:.3f} "
-                  f"retr@1 {sel['retr_cat_top1']:.3f} inst@1 {sel['retr_inst_top1']:.3f} | {rec['sec']}s")
+            print(f"ep {epoch:3d} loss {rec['train_loss']:.3f} | trainset shape@1 {tr['shape_top1']:.3f} | "
+                  f"{sel_name} shape@1 {sel['shape_top1']:.3f} @5 {sel['shape_top5']:.3f} nll {sel['shape_nll']:.3f} "
+                  f"retr@1 {sel['retr_cat_top1']:.3f} | {rec['sec']}s")
         log_line(log, rec)
         state = {"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
                  "epoch": epoch, "best": best, "epochs": args.epochs, "rng": rng_state()}
         save_resume(state, out_dir)
         if (epoch + 1) % args.snapshot_every == 0 or epoch == args.epochs - 1:
             save_snapshot(state, out_dir, f"epoch{epoch + 1:04d}.pt", keep=args.keep_snapshots)
-    print(f"done. best {sel_name} retr_cat_top1 = {best:.4f}; checkpoints in {out_dir}")
+    print(f"done. best {sel_name} {args.select} = {best:.4f}; checkpoints in {out_dir}")
 
 
 def load_trained(run: str, dev, which="best.pt"):
+    cfg = run_dir(run) / "config.json"
+    zs = json.loads(cfg.read_text()).get("zero_stream", "none") if cfg.exists() else "none"
+    if zs != "none":  # a single-stream encoder sees the same zeroed input at inference
+        ZERO_STREAM[f"{zs}_scale"] = 0.0
     model = build_encoder().to(dev)
     ck = torch.load(run_dir(run) / which, map_location=dev, weights_only=False)
     model.load_state_dict(ck["model"])
@@ -295,8 +327,10 @@ def diagnose(args):
 
     def add(name, ds, **kw):
         res[name] = score(embed(model, ds, dev, **kw), b, splits["test"], scale)
-        print(f"{name:28s} shape@1 {res[name]['shape_top1']:.3f}  shape@5 {res[name]['shape_top5']:.3f}  "
-              f"retr@1 {res[name]['retr_cat_top1']:.3f}  inst@1 {res[name]['retr_inst_top1']:.3f}")
+        r = res[name]
+        print(f"{name:30s} shape@1 {r['shape_top1']:.3f} (p={r['p_shape_top1']:.2g})  "
+              f"shape@5 {r['shape_top5']:.3f} (p={r['p_shape_top5']:.2g})  nll {r['shape_nll']:.3f}  "
+              f"retr@1 {r['retr_cat_top1']:.3f}  inst@1 {r['retr_inst_top1']:.3f}")
 
     print(f"chance: shape@1 {1/72:.3f}  shape@5 {5/72:.3f}  inst@1 {1/len(splits['test']):.3f}")
     add("test_repeats_averaged", test_avg)
@@ -304,6 +338,20 @@ def diagnose(args):
     add("dynamic_only (static=0)", test_avg, stat_scale=0.0)
     add("static_only (dynamic=0)", test_avg, dyn_scale=0.0)
     add("no_eeg (both=0)", test_avg, dyn_scale=0.0, stat_scale=0.0)
+
+    # mean ablation: replace one stream with the training-set mean EEG (stays in-distribution,
+    # unlike zeros). If a stream matters, replacing it should cost accuracy.
+    train_trials = np.flatnonzero(np.isin(b.trial_obj, splits["train"]))
+    means = {"dyn": b.dyn[train_trials].mean(0), "stat": b.stat[train_trials].mean(0)}
+    for stream in ("dyn", "stat"):
+        ds = EEG3D(b, splits["test"], train=False)
+        orig = ds._stream
+
+        def ablate(arr, key, trial, stream=stream, orig=orig):
+            target = b.dyn if stream == "dyn" else b.stat
+            return means[stream].astype(np.float32).copy() if arr is target else orig(arr, key, trial)
+        ds._stream = ablate
+        add(f"{'dynamic' if stream == 'dyn' else 'static'}_replaced_by_mean", ds)
 
     # shuffled EEG: pair each object's label with another object's EEG
     e = embed(model, test_avg, dev)
@@ -360,6 +408,10 @@ def main(argv=None):
     t.add_argument("--lr", type=float, default=1e-3)
     t.add_argument("--eval-every", type=int, default=1)
     t.add_argument("--restart", action="store_true", help="ignore existing checkpoints")
+    t.add_argument("--zero-stream", default="none", choices=["none", "dyn", "stat"],
+                   help="train a single-stream encoder: 'stat' zeroes the static input (dynamic-only model)")
+    t.add_argument("--select", default="shape_nll", choices=["shape_nll", "shape_top5", "shape_top1", "retr_cat_top1"],
+                   help="validation metric for best.pt; NLL is far less noisy than top-1 on 72 objects")
     t.add_argument("--snapshot-every", type=int, default=20, help="epochs between frozen full snapshots")
     t.add_argument("--keep-snapshots", type=int, default=0, help="keep only the newest N snapshots (0 = all)")
     for name in ("diagnose", "embed"):

@@ -158,6 +158,8 @@ def train(args):
     opt = torch.optim.AdamW(trainable_params(cond, net), lr=args.lr, betas=(0.95, 0.999))
     lrs = cosine_with_warmup(opt, min(2000, args.max_steps // 10), args.max_steps)
     step = 0
+    if args.restart and (out / "metrics.jsonl").exists():
+        (out / "metrics.jsonl").rename(out / f"metrics.{time.strftime('%Y%m%d-%H%M%S')}.jsonl")
     ck = None if args.restart else load_resume(out, dev)
     if ck is not None:
         step = load_ckpt(ck, net, cond, dev, opt, lrs)["step"]

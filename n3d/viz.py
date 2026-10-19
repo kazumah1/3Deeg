@@ -13,6 +13,7 @@ def curves(run: str, keys: list[str], x: str | None = None):
     import plotly.graph_objects as go
     rows = [json.loads(l) for l in (run_dir(run) / "metrics.jsonl").read_text().splitlines() if l.strip()]
     x = x or ("epoch" if "epoch" in rows[0] else "step")
+    rows = sorted({r[x]: r for r in rows}.values(), key=lambda r: r[x])  # a resume can repeat an x; keep the latest
     fig = go.Figure()
     for k in keys:
         pts = [(r[x], r[k]) for r in rows if k in r]

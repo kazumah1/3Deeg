@@ -21,7 +21,11 @@ os.environ.update({
     'N3D_UPSTREAM': '/content/n3d_cache',
     'TORCH_EXTENSIONS_DIR': '/content/drive/MyDrive/3deeg/torch_extensions',
 })
-!nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || echo 'no GPU'
+import torch
+if not torch.cuda.is_available():
+    print('WARNING: CPU-only runtime. Runtime > Change runtime type > GPU, then re-run this cell. '
+          'Encoder training is ~50x slower on CPU and PVCNN cannot run at all.')
+!nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 !rm -rf /content/3deeg && git clone -q -b $BRANCH https://github.com/kazumah1/3deeg /content/3deeg
 %cd /content/3deeg
 !git log --oneline -1
@@ -30,14 +34,16 @@ from n3d import viz"""),
     md("## 2. Data (once; ~1.1 GB for sub01, kept on Drive)\n"
        "Add participants later with `--participants sub02 sub03 ...`; already-packed files are skipped."),
     code("!python -m n3d.download --participants sub01"),
-    md("## 3. Encoder overfit check (4 categories, ~1-2 min)\n"
-       "Train loss should fall steadily and val accuracy should rise above chance. If it doesn't, stop and debug before step 4."),
+    md("## 3. Encoder overfit check (4 categories, ~1-2 min on GPU)\n"
+       "The pass condition is `trainset_shape_top1` climbing toward 1.0 (the model can memorise its own training "
+       "objects). Val has only 4 objects here, so its accuracy moves in steps of 0.25 and is not the check."),
     code("""!python -m n3d.encoder train --run enc_tiny --tiny --epochs 60 --batch-size 32 --restart
-viz.curves('enc_tiny', ['train_loss', 'val_shape_top1', 'val_retr_cat_top1']).show()"""),
+viz.curves('enc_tiny', ['train_loss', 'trainset_shape_top1', 'val_shape_top1']).show()"""),
     md("## 4. Full encoder, sub01 (upstream recipe: 200 epochs)\n"
        "Resumable: re-run the same cell after a disconnect. Selection is on val (variant 07); test is only reported."),
     code("""!python -m n3d.encoder train --run enc_sub01 --epochs 200
-viz.curves('enc_sub01', ['val_shape_top1', 'val_shape_top5', 'val_retr_cat_top1', 'test_shape_top1', 'test_retr_cat_top1']).show()"""),
+viz.curves('enc_sub01', ['val_shape_nll']).show()
+viz.curves('enc_sub01', ['trainset_shape_top1', 'val_shape_top5', 'test_shape_top5', 'val_shape_top1', 'test_shape_top1']).show()"""),
     md("## 5. Failure-point diagnostics and reference baselines (cheap)\n"
        "* `diagnose`: averaged vs single-trial EEG, each stream zeroed, shuffled EEG, noise sweep, within-category 2AFC, "
        "within-category shape probe.\n"
