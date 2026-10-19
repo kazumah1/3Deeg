@@ -26,6 +26,7 @@ if not torch.cuda.is_available():
     print('WARNING: CPU-only runtime. Runtime > Change runtime type > GPU, then re-run this cell. '
           'Encoder training is ~50x slower on CPU and PVCNN cannot run at all.')
 !nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
+%cd /content
 !rm -rf /content/3deeg && git clone -q -b $BRANCH https://github.com/kazumah1/3deeg /content/3deeg
 %cd /content/3deeg
 !git log --oneline -1
