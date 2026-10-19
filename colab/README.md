@@ -10,9 +10,30 @@ The code is in `n3d/`; notebooks only call it. Open
 | --- | --- | --- |
 | Downloaded archives | `MyDrive/3deeg/data/neuro-3d/archives/` | Pinned HF revision, fetched once |
 | Packed arrays | `MyDrive/3deeg/data/neuro-3d/packed/` | What every experiment loads |
-| Runs | `MyDrive/3deeg/runs/<run>/` | `config.json`, `metrics.jsonl`, `last.pt` (resume), `best.pt` |
+| Runs | `MyDrive/3deeg/runs/<run>/` | `config.json`, `metrics.jsonl`, `best.pt`, plus the checkpoints below |
 | Compiled PVCNN ops | `MyDrive/3deeg/torch_extensions/` | Reused while torch/CUDA versions match |
 | Upstream Neuro-3D code | `/content/n3d_cache/` | Cloned at a pinned commit each runtime; not vendored (no licence) |
+
+## Checkpoints and disconnects
+
+Re-running a training cell resumes automatically; pass `--restart` to start over.
+
+| File | Written | Contents | Kept |
+| --- | --- | --- | --- |
+| `last.pt` | encoder: every epoch; diffusion: every `--ckpt-every` steps (1,000) | model + optimizer + scheduler + RNG | newest only |
+| `last_prev.pt` | each time `last.pt` is replaced | the previous `last.pt` | newest only |
+| `snapshots/` | encoder: every `--snapshot-every` epochs (20); diffusion: every `--snapshot-every` steps (5,000) | full state, resumable | encoder all; diffusion newest `--keep-snapshots` (3) |
+| `milestones/` | diffusion: every `--milestone-every` steps (10,000) | weights only, for `sample --ckpt milestones/stepXXXXXXX.pt` | all |
+
+Every checkpoint is written to a temp file and renamed into place, so a kill mid-save
+cannot corrupt it. Resume tries `last.pt`, then `last_prev.pt`, then snapshots newest first,
+skipping any file that fails to load (for example one Drive never finished uploading).
+Logs are opened and closed per line because Drive uploads a file only after it is closed.
+
+Drive syncs in the background, so a runtime that dies abruptly can lose the last few
+minutes of writes. That is why `last_prev.pt` and the snapshots exist: the worst case is
+falling back one snapshot interval. After a long run, `drive.flush_and_unmount()` forces
+the final upload before you disconnect.
 
 ## Commands
 

@@ -30,6 +30,7 @@ from torch.utils.data import DataLoader
 
 from . import config
 from .data import EEG3D, Bundle, load_bundle, make_splits
+from .ckpt import atomic_save, load_resume, log_line, save_resume, save_snapshot
 from .upstream import build_encoder
 
 
@@ -38,6 +39,27 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def seed_worker(_):
+    """Give each DataLoader worker its own augmentation stream (otherwise every worker
+    copies the dataset's generator and draws identical noise)."""
+    info = torch.utils.data.get_worker_info()
+    info.dataset.rng = np.random.default_rng(torch.initial_seed() % 2**32)
+
+
+def rng_state() -> dict:
+    return {"torch": torch.get_rng_state(), "numpy": np.random.get_state(), "python": random.getstate(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
+
+
+def restore_rng(ck: dict) -> None:
+    r = ck.get("rng")
+    if not r:
+        return
+    torch.set_rng_state(r["torch"]); np.random.set_state(r["numpy"]); random.setstate(r["python"])
+    if r.get("cuda") and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(r["cuda"])
 
 
 def device() -> torch.device:
@@ -145,7 +167,7 @@ def train(args):
     test_ds = EEG3D(b, splits["test"], train=False)
     bs = min(args.batch_size, len(train_ds))
     loader = DataLoader(train_ds, batch_size=bs, shuffle=True, drop_last=True, num_workers=2,
-                        persistent_workers=True)
+                        persistent_workers=True, worker_init_fn=seed_worker)
 
     model = build_encoder().to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
@@ -153,17 +175,17 @@ def train(args):
                                                 final_div_factor=10000, pct_start=min(0.3, 2 / args.epochs))
     color_w = torch.tensor(config.COLOR_CLASS_WEIGHTS, device=dev)
     start, best = 0, -1.0
-    last = out_dir / "last.pt"
-    if last.exists() and not args.restart:
-        ck = torch.load(last, map_location=dev, weights_only=False)
+    ck = None if args.restart else load_resume(out_dir, dev)
+    if ck is not None:
         if ck.get("epochs", args.epochs) != args.epochs:
             raise SystemExit(f"last.pt was trained with --epochs {ck['epochs']}; resume with the same value "
                              "(the OneCycle schedule depends on it) or pass --restart")
         model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"]); sched.load_state_dict(ck["sched"])
         start, best = ck["epoch"] + 1, ck["best"]
+        restore_rng(ck)
         print(f"resumed at epoch {start} (best {sel_name} retr_cat_top1 {best:.4f})")
 
-    log = (out_dir / "metrics.jsonl").open("a")
+    log = out_dir / "metrics.jsonl"
     for epoch in range(start, args.epochs):
         model.train()
         t0, parts, n = time.time(), {}, 0
@@ -186,13 +208,16 @@ def train(args):
                 rec |= {f"test_{k}": v for k, v in score(embed(model, test_ds, dev), b, splits["test"], scale).items()}
             if sel["retr_cat_top1"] > best:
                 best = sel["retr_cat_top1"]
-                torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": rec}, out_dir / "best.pt")
+                atomic_save({"model": model.state_dict(), "epoch": epoch, "metrics": rec}, out_dir / "best.pt")
                 rec["saved_best"] = True
             print(f"ep {epoch:3d} loss {rec['train_loss']:.3f} | {sel_name} shape@1 {sel['shape_top1']:.3f} "
                   f"retr@1 {sel['retr_cat_top1']:.3f} inst@1 {sel['retr_inst_top1']:.3f} | {rec['sec']}s")
-        log.write(json.dumps(rec) + "\n"); log.flush()
-        torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
-                    "epoch": epoch, "best": best, "epochs": args.epochs}, last)
+        log_line(log, rec)
+        state = {"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
+                 "epoch": epoch, "best": best, "epochs": args.epochs, "rng": rng_state()}
+        save_resume(state, out_dir)
+        if (epoch + 1) % args.snapshot_every == 0 or epoch == args.epochs - 1:
+            save_snapshot(state, out_dir, f"epoch{epoch + 1:04d}.pt", keep=args.keep_snapshots)
     print(f"done. best {sel_name} retr_cat_top1 = {best:.4f}; checkpoints in {out_dir}")
 
 
@@ -334,7 +359,9 @@ def main(argv=None):
     t.add_argument("--batch-size", type=int, default=128)
     t.add_argument("--lr", type=float, default=1e-3)
     t.add_argument("--eval-every", type=int, default=1)
-    t.add_argument("--restart", action="store_true", help="ignore last.pt")
+    t.add_argument("--restart", action="store_true", help="ignore existing checkpoints")
+    t.add_argument("--snapshot-every", type=int, default=20, help="epochs between frozen full snapshots")
+    t.add_argument("--keep-snapshots", type=int, default=0, help="keep only the newest N snapshots (0 = all)")
     for name in ("diagnose", "embed"):
         p = sub.add_parser(name); common_args(p)
         p.add_argument("--ckpt", default="best.pt")

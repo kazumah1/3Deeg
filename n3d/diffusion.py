@@ -37,7 +37,8 @@ from torch.utils.data import DataLoader
 from . import config
 from .data import EEG3D, load_bundle, make_splits
 from .denoisers import build_denoiser
-from .encoder import device, load_trained, run_dir, set_seed
+from .ckpt import atomic_save, load_resume, log_line, save_resume, save_snapshot
+from .encoder import device, load_trained, restore_rng, rng_state, run_dir, seed_worker, set_seed
 from .metrics import chamfer_torch
 
 
@@ -108,14 +109,14 @@ def sample(net, cond_vec, sched, n_points=config.N_POINTS, steps=100, generator=
     return x
 
 
-def save_ckpt(path, net, cond, opt, sched, step, extra=None):
-    torch.save({"net": net.state_dict(), "cond": {k: v for k, v in cond.state_dict().items() if not k.startswith("encoder.")},
-                "opt": opt.state_dict() if opt else None, "sched": sched.state_dict() if sched else None,
-                "step": step, **(extra or {})}, path)
+def ckpt_state(net, cond, opt, sched, step, extra=None) -> dict:
+    return {"net": net.state_dict(), "cond": {k: v for k, v in cond.state_dict().items() if not k.startswith("encoder.")},
+            "opt": opt.state_dict() if opt else None, "sched": sched.state_dict() if sched else None,
+            "step": step, "rng": rng_state(), **(extra or {})}
 
 
-def load_ckpt(path, net, cond, dev, opt=None, sched=None):
-    ck = torch.load(path, map_location=dev, weights_only=False)
+def load_ckpt(path_or_ck, net, cond, dev, opt=None, sched=None):
+    ck = path_or_ck if isinstance(path_or_ck, dict) else torch.load(path_or_ck, map_location=dev, weights_only=False)
     net.load_state_dict(ck["net"])
     cond.load_state_dict(ck["cond"], strict=False)
     if opt is not None and ck.get("opt"):
@@ -151,20 +152,22 @@ def train(args):
     (out / "config.json").write_text(json.dumps(vars(args), indent=1, default=str))
     ds = EEG3D(b, splits["train"], train=True, seed=args.seed)
     loader = DataLoader(ds, batch_size=min(args.batch_size, len(ds)), shuffle=True, drop_last=True,
-                        num_workers=2, persistent_workers=True)
+                        num_workers=2, persistent_workers=True, worker_init_fn=seed_worker)
     cond, net = build(args, dev, b)
     ddpm, ddim = make_schedulers()
     opt = torch.optim.AdamW(trainable_params(cond, net), lr=args.lr, betas=(0.95, 0.999))
     lrs = cosine_with_warmup(opt, min(2000, args.max_steps // 10), args.max_steps)
     step = 0
-    if (out / "last.pt").exists() and not args.restart:
-        step = load_ckpt(out / "last.pt", net, cond, dev, opt, lrs)["step"]
+    ck = None if args.restart else load_resume(out, dev)
+    if ck is not None:
+        step = load_ckpt(ck, net, cond, dev, opt, lrs)["step"]
+        restore_rng(ck)
         print(f"resumed at step {step}")
     n_params = sum(p.numel() for p in net.parameters())
     print(f"denoiser {args.denoiser}/{args.cond_mode}: {n_params/1e6:.2f}M params; cond={args.cond_source}; "
           f"train objects {len(splits['train'])}, samples {len(ds)}")
     eval_split = "val" if len(splits.get("val", [])) else "test"
-    log = (out / "metrics.jsonl").open("a")
+    log = out / "metrics.jsonl"
     alphas = ddpm.alphas_cumprod.to(dev)
     t0, running = time.time(), []
     while step < args.max_steps:
@@ -195,11 +198,15 @@ def train(args):
                                         gt=batch_e["points"].numpy(), obj=np.asarray(batch_e["obj"]))
                     t0 = time.time()
                 print(" ".join(f"{k} {v:.4g}" if isinstance(v, float) else f"{k} {v}" for k, v in rec.items()))
-                log.write(json.dumps(rec) + "\n"); log.flush()
+                log_line(log, rec)
             if step % args.ckpt_every == 0 or step == args.max_steps:
-                save_ckpt(out / "last.pt", net, cond, opt, lrs, step)
-                if step % (args.ckpt_every * 5) == 0:
-                    save_ckpt(out / f"step{step:07d}.pt", net, cond, None, None, step)
+                state = ckpt_state(net, cond, opt, lrs, step)
+                save_resume(state, out)
+                if step % args.snapshot_every == 0 or step == args.max_steps:
+                    save_snapshot(state, out, f"step{step:07d}.pt", keep=args.keep_snapshots)
+                if step % args.milestone_every == 0:  # weights only, never pruned: for evaluating along training
+                    (out / "milestones").mkdir(exist_ok=True)
+                    atomic_save(ckpt_state(net, cond, None, None, step), out / "milestones" / f"step{step:07d}.pt")
             if step >= args.max_steps:
                 break
     print(f"done at step {step}; checkpoints in {out}")
@@ -307,7 +314,10 @@ def main(argv=None):
     t.add_argument("--eval-every", type=int, default=2000)
     t.add_argument("--eval-steps", type=int, default=50, help="DDIM steps for in-training eval")
     t.add_argument("--n-eval", type=int, default=16)
-    t.add_argument("--ckpt-every", type=int, default=1000)
+    t.add_argument("--ckpt-every", type=int, default=1000, help="steps between rolling last.pt saves")
+    t.add_argument("--snapshot-every", type=int, default=5000, help="steps between frozen full snapshots")
+    t.add_argument("--keep-snapshots", type=int, default=3, help="full snapshots kept (they include optimizer state)")
+    t.add_argument("--milestone-every", type=int, default=10000, help="steps between weights-only milestones")
     t.add_argument("--seed", type=int, default=1234)
     t.add_argument("--restart", action="store_true")
     for name in ("sample", "swap"):
