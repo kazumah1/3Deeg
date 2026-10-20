@@ -1,0 +1,16 @@
+{
+  "method": "one_pca_aligned_oriented_bounding_cuboid",
+  "participant": "sub01",
+  "objects": 10,
+  "points_per_object": 8192,
+  "surface_samples_per_object": 8192,
+  "seed": 20261014,
+  "manifest": "benchmark/primitive_10_objects.csv",
+  "convergence_status": "closed_form_pca",
+  "iterations_per_object": 1,
+  "chamfer_definition": "symmetric mean squared nearest-neighbor distance",
+  "mean_chamfer_squared": 0.028638055799999996,
+  "median_chamfer_squared": 0.018422902,
+  "total_fit_seconds": 0.003830084,
+  "total_evaluation_seconds": 0.06944758300000001
+}

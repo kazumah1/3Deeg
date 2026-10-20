@@ -1,0 +1,11 @@
+benchmark_rank,label,category_id,category,variant,shape_family,split_role,trial_indices,geometry_path,point_count
+1,01_airplane_08,01,airplane,08,"articulated, thin wings",test,382 740 1346 1609,extracted/point_cloud/airplane_08.npy,8192
+2,04_banana_08,04,banana,08,curved elongated,test,605 780 962 1615,extracted/point_cloud/banana_08.npy,8192
+3,10_bottle_08,10,bottle,08,rotational,test,326 775 1474 1584,extracted/point_cloud/bottle_08.npy,8192
+4,15_chair_08,15,chair,08,multi-part furniture,test,566 798 1274 1689,extracted/point_cloud/chair_08.npy,8192
+5,16_Christmas_tree_08,16,Christmas_tree,08,branched,test,580 838 1518 1680,extracted/point_cloud/Christmas_tree_08.npy,8192
+6,21_elephant_08,21,elephant,08,organic articulated,test,600 752 935 1620,extracted/point_cloud/elephant_08.npy,8192
+7,27_guitar_08,27,guitar,08,curved body and thin neck,test,214 820 1498 1672,extracted/point_cloud/guitar_08.npy,8192
+8,43_motorcycle_08,43,motorcycle,08,complex mechanical,test,63 837 1065 1692,extracted/point_cloud/motorcycle_08.npy,8192
+9,52_ring_08,52,ring,08,hollow toroidal,test,471 756 1275 1705,extracted/point_cloud/ring_08.npy,8192
+10,61_spider_08,61,spider,08,many thin limbs,test,64 726 1387 1691,extracted/point_cloud/spider_08.npy,8192

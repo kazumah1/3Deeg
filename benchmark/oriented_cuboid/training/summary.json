@@ -1,0 +1,18 @@
+{
+  "method": "one_pca_aligned_oriented_bounding_cuboid",
+  "participant": "sub01",
+  "split_role": "train",
+  "objects": 576,
+  "points_per_object": 8192,
+  "surface_samples_per_object": 8192,
+  "seed": 20261014,
+  "fit_method": "closed-form PCA orientation with minimum/maximum local-coordinate extents",
+  "convergence_status": "closed_form_pca",
+  "iterations_per_object": 1,
+  "chamfer_definition": "symmetric mean squared nearest-neighbor distance",
+  "mean_chamfer_squared": 0.028472736723958336,
+  "median_chamfer_squared": 0.023791187,
+  "mean_normalized_chamfer": 0.015288476965277778,
+  "total_fit_seconds": 0.219726529,
+  "total_evaluation_seconds": 3.573269793
+}
