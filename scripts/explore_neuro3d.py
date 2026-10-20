@@ -31,7 +31,7 @@ class Dataset:
             if data.shape != (len(self.labels), 64, 250 if window == '1s_250Hz' else 600):
                 raise ValueError(f'Unexpected EEG shape: {window}: {data.shape}')
         self.cuboids = {}
-        cuboid_path = root / 'processed/v1/oriented_cuboid_10_object_benchmark/fitted_cuboids.npz'
+        cuboid_path = Path(__file__).resolve().parents[1] / 'benchmark/oriented_cuboid/ten_object/fitted_cuboids.npz'
         if cuboid_path.is_file():
             fitted = np.load(cuboid_path, allow_pickle=False)
             metrics = {}

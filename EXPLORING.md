@@ -31,9 +31,8 @@ A recognizable target and a plausible EEG trace do not establish that an EEG dec
 The explorer recognizes the prepared ten-object primitive benchmark. Use the **Primitive benchmark** selector or **Next benchmark object** to move through the held-out `08` objects without manually changing category and variant. Selecting one automatically enables the amber **Fitted cuboid surface** overlay and shows that object's squared Chamfer score beside the trial information. The control is disabled for all other objects, which have no subset cuboid fit. Rebuild the fit with:
 
 ```sh
-.venv/bin/python scripts/benchmark_oriented_cuboids.py \
-  --manifest data/neuro-3d/processed/v1/primitive_benchmark_10_objects.csv \
-  --output-dir data/neuro-3d/processed/v1/oriented_cuboid_10_object_benchmark
+.venv/bin/python benchmark/scripts/benchmark_oriented_cuboids.py \
+  --manifest benchmark/primitive_10_objects.csv
 ```
 
 ## What we have checked
