@@ -2,6 +2,7 @@
 """Serve a local EEG/point-cloud explorer. No source data is modified."""
 import argparse
 from collections import Counter
+import csv
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -29,11 +30,23 @@ class Dataset:
         for window, data in self.eeg.items():
             if data.shape != (len(self.labels), 64, 250 if window == '1s_250Hz' else 600):
                 raise ValueError(f'Unexpected EEG shape: {window}: {data.shape}')
+        self.cuboids = {}
+        cuboid_path = root / 'processed/v1/oriented_cuboid_10_object_benchmark/fitted_cuboids.npz'
+        if cuboid_path.is_file():
+            fitted = np.load(cuboid_path, allow_pickle=False)
+            metrics = {}
+            metric_path = cuboid_path.with_name('per_object.csv')
+            if metric_path.is_file():
+                with metric_path.open(newline='', encoding='utf-8') as handle:
+                    metrics = {row['label']: dict(chamfer_squared=float(row['chamfer_squared'])) for row in csv.DictReader(handle)}
+            self.cuboids = {str(label): dict(center=fitted['centers'][index].tolist(), axes=fitted['axes'][index].tolist(),
+                                             extents=fitted['extents'][index].tolist(), **metrics.get(str(label), {}))
+                            for index, label in enumerate(fitted['labels'])}
 
     def summary(self):
         return dict(participant=self.participant, trials=len(self.labels), objects=self.objects,
                     categories=len({o['category'] for o in self.objects}),
-                    repeats=dict(Counter(len(o['trials']) for o in self.objects)))
+                    repeats=dict(Counter(len(o['trials']) for o in self.objects)), benchmark_objects=sorted(self.cuboids))
 
     def sample(self, trial, window):
         if window not in self.eeg or not 0 <= trial < len(self.labels):
@@ -45,6 +58,11 @@ class Dataset:
             raise ValueError('Unexpected point-cloud shape or nonfinite data')
         return dict(label=label, trial=trial, window=window, hz=250 if window == '1s_250Hz' else 100,
                     points=points.tolist(), eeg=eeg.tolist(), std=float(eeg.std()))
+
+    def cuboid(self, label):
+        if label not in self.cuboids:
+            raise ValueError('No fitted cuboid is available for this object')
+        return dict(label=label, **self.cuboids[label])
 
 
 def main():
@@ -68,6 +86,9 @@ def main():
                     query = parse_qs(route.query)
                     sample = dataset.sample(int(query.get('trial', ['0'])[0]), query.get('window', ['1s_250Hz'])[0])
                     payload, mime = json.dumps(sample, allow_nan=False).encode(), 'application/json'
+                elif route.path == '/api/cuboid':
+                    query = parse_qs(route.query)
+                    payload, mime = json.dumps(dataset.cuboid(query.get('label', [''])[0]), allow_nan=False).encode(), 'application/json'
                 else:
                     self.send_error(404)
                     return
