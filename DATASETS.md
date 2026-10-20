@@ -42,6 +42,8 @@ Project-specific outputs will live at **`data/neuro-3d/processed/v1/`**, corresp
 
 Build the first derived artifact with `.venv/bin/python scripts/build_trial_index.py`. It creates a row for every EEG trial, with its source label, category, variant, repeat ordinal, matching geometry path, and the upstream-compatible `train`/`test` role. The `08` and `09` variants are marked `test`; all other variants are marked `train`. See [EXPLORING.md](EXPLORING.md#trial-to-object-index) for the command and field semantics.
 
+Prepare the geometry-only primitive-fitting subset with `.venv/bin/python scripts/prepare_primitive_benchmark.py`. It creates a ten-object CSV manifest and packed XYZ/RGB arrays under `processed/v1/`; see [PRIMITIVE_BENCHMARK.md](PRIMITIVE_BENCHMARK.md) for the fixed selection and evaluation protocol.
+
 ### Team availability
 
 Each checkout uses its own local data directory; no shared server or team storage location has been configured. Teammates can reproduce the validated subset using the commands above. The status entries above describe the initial development validation, not data included in a fresh checkout. Dataset files are excluded from Git, so a repository checkout alone does not contain them. A future shared copy should publish its storage address and access instructions here.
