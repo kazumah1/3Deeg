@@ -46,11 +46,12 @@ Confirmed repository facts from the Hugging Face file manifest:
 - `sub01` and core point clouds have been downloaded, extracted, and integrity-verified.
 - Available upstream processed EEG: `data/neuro-3d/extracted/sub01/`.
 - Geometry targets: `data/neuro-3d/extracted/point_cloud/`.
-- Future project-specific preprocessing: `data/neuro-3d/processed/v1/` (reserved; not generated).
+- Trial-to-object index: `data/neuro-3d/processed/v1/sub01_trial_to_object_index.csv` (generated locally from the verified labels; 1,728 rows).
+- Future signal preprocessing: `data/neuro-3d/processed/v1/` (reserved; not generated).
 - Default local root: `<checkout>/data/neuro-3d/` (download separately on each machine).
 - No shared team storage has been configured; teammates can reproduce the subset locally.
 - EEG archives extract to `sub01/`, rather than the older upstream `EEGdata/sub01/` layout.
-- Setup preserves upstream files and does not add normalization, dataset splits, or an encoder/training stack.
+- Setup preserves upstream files and does not add normalization, dataset splits, or an encoder/training stack. `scripts/build_trial_index.py` derives a local mapping from every trial to its source object and upstream-compatible split role.
 - Dataset files and caches are ignored by Git.
 - Local explorer: `.venv/bin/python scripts/explore_neuro3d.py`, then open `http://127.0.0.1:8765`; see `EXPLORING.md`.
 - NumPy is installed in `.venv`; exploration requirements are in `requirements-explore.txt`.
@@ -63,7 +64,7 @@ Confirmed repository facts from the Hugging Face file manifest:
 - Explorer code and team walkthrough are saved in `scripts/explore_neuro3d.py`, `explorer/index.html`, and `EXPLORING.md`.
 - Launch: `.venv/bin/python scripts/explore_neuro3d.py`; open `http://127.0.0.1:8765`. Restart the server if needed in a later session.
 - Browser rendering was inspected; geometry, EEG trace, and heatmap loaded successfully. API checks covered both recording windows, label mapping, point counts, and invalid requests.
-- Available data remains sub01 plus core point clouds. No encoder, generator, or project-specific preprocessing outputs have been created.
+- Available data remains sub01 plus core point clouds. The local trial-to-object index has been generated; no encoder, generator, or signal preprocessing outputs have been created.
 - Suggested next step when resuming: establish encoder inputs and checkpoint availability, then inspect embeddings before selecting a geometry generator.
 
 ## Saved Discussion — October 8, 2026

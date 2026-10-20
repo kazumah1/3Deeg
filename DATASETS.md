@@ -31,13 +31,16 @@ Paths below are relative to the workspace root, or to the directory selected by 
 | Original downloaded archives and source manifest | `data/neuro-3d/archives/`, `data/neuro-3d/manifest.json` | Downloaded for sub01 and point clouds |
 | Upstream processed EEG arrays and trial labels | `data/neuro-3d/extracted/sub01/` | Present and integrity-verified |
 | Geometry targets | `data/neuro-3d/extracted/point_cloud/` | Present and integrity-verified |
-| Future project-specific preprocessing | `data/neuro-3d/processed/v1/` | Reserved; not generated yet |
+| Trial-to-object index | `data/neuro-3d/processed/v1/sub01_trial_to_object_index.csv` | Generated locally from verified labels |
+| Future project-specific preprocessing | `data/neuro-3d/processed/v1/` | Reserved; no signal transformation generated yet |
 
 After extraction, upstream processed EEG is available at `<checkout>/data/neuro-3d/extracted/sub01/` (or `<data-dir>/extracted/sub01/` for a custom destination).
 
 It contains `process_data_1s_250Hz.npy`, `process_data_6s_100Hz.npy`, and `name_label.npy`. Geometry is alongside it in `extracted/point_cloud/`. These are the arrays distributed by the dataset authors. Our setup extracts them unchanged; it has not run additional normalization, train/test splitting, encoder embedding extraction, or EEG-to-geometry alignment validation.
 
 Project-specific outputs will live at **`data/neuro-3d/processed/v1/`**, corresponding to **`<checkout>/data/neuro-3d/processed/v1/`**. When preprocessing is implemented, each version should include its source revision, participant list, transformation settings, split assignments, and reproduction command. Preserve the extracted source files and use a new version directory when the preprocessing changes.
+
+Build the first derived artifact with `.venv/bin/python scripts/build_trial_index.py`. It creates a row for every EEG trial, with its source label, category, variant, repeat ordinal, matching geometry path, and the upstream-compatible `train`/`test` role. The `08` and `09` variants are marked `test`; all other variants are marked `train`. See [EXPLORING.md](EXPLORING.md#trial-to-object-index) for the command and field semantics.
 
 ### Team availability
 
