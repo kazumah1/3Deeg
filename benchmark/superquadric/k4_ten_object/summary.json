@@ -1,0 +1,24 @@
+{
+  "method": "k_superquadrics_shared_sweep_then_per_component_epsilon_refinement",
+  "k": 4,
+  "participant": "sub01",
+  "objects": 10,
+  "surface_samples_per_object": 8192,
+  "shared_epsilon_grid": [
+    0.2,
+    0.4,
+    0.6,
+    0.8,
+    1.0
+  ],
+  "epsilon_bounds": [
+    0.1,
+    1.0
+  ],
+  "initialization": "matching precomputed k-oriented cuboids: center, PCA axes, half extents",
+  "objective": "symmetric squared Chamfer; local objectives for optimization, full union for selection and reporting",
+  "mean_chamfer_squared": 0.0017010186,
+  "median_chamfer_squared": 0.001567065,
+  "total_fit_seconds": 201.563127376,
+  "total_evaluation_seconds": 0.765679209
+}

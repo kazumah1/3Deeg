@@ -17,7 +17,9 @@ python3 -m venv .venv
 
 Open **http://127.0.0.1:8765**. The initial setup downloads sub01 EEG and all core point clouds (about 814 MB); allow at least 2 GB free. Data is downloaded separately and excluded from Git. No EEG decoding model is running.
 
-The explorer can overlay the fitted PCA-oriented cuboid surface for the prepared ten-object benchmark. Generate or refresh those fits with `.venv/bin/python benchmark/scripts/benchmark_oriented_cuboids.py --manifest benchmark/primitive_10_objects.csv`.
+The explorer can overlay precomputed PCA-oriented cuboids for each k from 1 through 8 on the prepared ten-object benchmark. Generate or refresh those fits with `for k in {1..8}; do .venv/bin/python benchmark/scripts/benchmark_k_oriented_cuboids.py --manifest benchmark/primitive_10_objects.csv --k "$k"; done`.
+
+It also exposes superquadrics for k=1 through k=8. Each starts from the corresponding cuboid decomposition, evaluates the 25 shared ε₁/ε₂ pairs, then refines ε values per component. Generate them with `for k in {1..8}; do .venv/bin/python benchmark/scripts/benchmark_superquadrics.py --k "$k"; done`.
 
 **Understand the baseline:** [developer guide to oriented cuboid fitting](benchmark/oriented_cuboid_fitting.md). All benchmark inputs, methods, results, and previews live in [benchmark/](benchmark/).
 

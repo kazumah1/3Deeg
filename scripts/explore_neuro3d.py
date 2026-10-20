@@ -25,8 +25,28 @@ def load_cuboid_fit(path, kind):
         centers, axes, extents = fitted['centers'][index], fitted['axes'][index], fitted['extents'][index]
         if centers.ndim == 1:
             centers, axes, extents = centers[None], axes[None], extents[None]
-        result[str(label)] = dict(kind=kind, k=len(centers), components=[dict(center=center.tolist(), axes=axis.tolist(), extents=extent.tolist())
+        result[str(label)] = dict(kind=kind, primitive='cuboid', k=len(centers), components=[dict(center=center.tolist(), axes=axis.tolist(), extents=extent.tolist())
                                                                          for center, axis, extent in zip(centers, axes, extents)],
+                                  **metrics.get(str(label), {}))
+    return result
+
+
+def load_superquadric_fit(path, kind):
+    if not path.is_file():
+        return {}
+    fitted = np.load(path, allow_pickle=False)
+    metrics = {}
+    metric_path = path.with_name('per_object.csv')
+    if metric_path.is_file():
+        with metric_path.open(newline='', encoding='utf-8') as handle:
+            metrics = {row['label']: dict(chamfer_squared=float(row['chamfer_squared'])) for row in csv.DictReader(handle)}
+    result = {}
+    for index, label in enumerate(fitted['labels']):
+        centers, axes, scales, epsilons = (fitted[key][index] for key in ('centers', 'axes', 'scales', 'epsilons'))
+        result[str(label)] = dict(kind=kind, primitive='superquadric', k=len(centers),
+                                  components=[dict(center=center.tolist(), axes=axis.tolist(), scales=scale.tolist(),
+                                                   epsilon_1=float(epsilon[0]), epsilon_2=float(epsilon[1]))
+                                              for center, axis, scale, epsilon in zip(centers, axes, scales, epsilons)],
                                   **metrics.get(str(label), {}))
     return result
 
@@ -51,10 +71,16 @@ class Dataset:
             if data.shape != (len(self.labels), 64, 250 if window == '1s_250Hz' else 600):
                 raise ValueError(f'Unexpected EEG shape: {window}: {data.shape}')
         benchmark_root = Path(__file__).resolve().parents[1] / 'benchmark'
-        self.cuboid_fits = {
-            'single': load_cuboid_fit(benchmark_root / 'oriented_cuboid/ten_object/fitted_cuboids.npz', 'single'),
-            'k4': load_cuboid_fit(benchmark_root / 'k_oriented_cuboid/k4_ten_object/fitted_cuboids.npz', 'k4'),
-        }
+        fitted_root = benchmark_root / 'k_oriented_cuboid'
+        fit_paths = sorted(fitted_root.glob('k*_ten_object/fitted_cuboids.npz'),
+                           key=lambda path: int(path.parent.name.split('_', 1)[0][1:]))
+        self.cuboid_fits = {f'k{int(path.parent.name.split("_", 1)[0][1:])}': load_cuboid_fit(
+                            path, f'k{int(path.parent.name.split("_", 1)[0][1:])}') for path in fit_paths}
+        superquadric_root = benchmark_root / 'superquadric'
+        superquadric_paths = sorted(superquadric_root.glob('k*_ten_object/fitted_superquadrics.npz'),
+                                    key=lambda path: int(path.parent.name.split('_', 1)[0][1:]))
+        self.cuboid_fits.update({f'sqk{int(path.parent.name.split("_", 1)[0][1:])}': load_superquadric_fit(
+                                path, f'sqk{int(path.parent.name.split("_", 1)[0][1:])}') for path in superquadric_paths})
         self.cuboid_fits = {kind: fits for kind, fits in self.cuboid_fits.items() if fits}
 
     def summary(self):

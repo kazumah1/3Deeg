@@ -1,0 +1,18 @@
+{
+  "method": "k_pca_aligned_oriented_bounding_cuboids",
+  "k": 3,
+  "participant": "sub01",
+  "objects": 10,
+  "points_per_object": 8192,
+  "surface_samples_per_object": 8192,
+  "seed": 20261017,
+  "manifest": "benchmark/primitive_10_objects.csv",
+  "clustering": "deterministic farthest-point initialization followed by Lloyd k-means",
+  "max_iterations": 100,
+  "tolerance": 1e-08,
+  "chamfer_definition": "symmetric mean squared nearest-neighbor distance",
+  "mean_chamfer_squared": 0.0084421675,
+  "median_chamfer_squared": 0.0071009705,
+  "total_fit_seconds": 0.07809221,
+  "total_evaluation_seconds": 0.053305958
+}

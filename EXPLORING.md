@@ -28,11 +28,21 @@ A recognizable target and a plausible EEG trace do not establish that an EEG dec
 
 ## Fitted cuboid overlay
 
-The explorer recognizes the prepared ten-object primitive benchmark. Use the **Primitive benchmark** selector or **Next benchmark object** to move through the held-out ten objects without manually changing category and variant. Select **1 oriented cuboid** or the precomputed **k=4 oriented cuboids**, then enable **Fitted cuboid geometry** to view the colored, 50%-opaque solid cuboids. Enable or disable **Cuboid surface points** independently when you want to compare the sampled primitive surfaces with the original cloud. The displayed squared Chamfer score changes with the selected fit. These controls are disabled for all other objects, which have no subset cuboid fit. Rebuild the single-cuboid fit with:
+The explorer recognizes the prepared ten-object primitive benchmark. Use the **Primitive benchmark** selector or **Next benchmark object** to move through the held-out ten objects without manually changing category and variant. Select any precomputed **k=1** through **k=8 oriented cuboid** or **superquadric** fit, then enable **Fitted primitive geometry** to view the colored, 50%-opaque solids. Toggle **Original point cloud** off to inspect only the primitives, and enable or disable **Primitive surface points** independently when you want to compare sampled surfaces with the original cloud. The displayed squared Chamfer score changes with the selected fit. Superquadrics use the matching cuboids for translation, PCA orientation, and scales; their fitted ε₁/ε₂ values are supplied to the visualizer. The controls are disabled for all other objects, which have no subset primitive fit. Rebuild all cuboid fits with:
 
 ```sh
-.venv/bin/python benchmark/scripts/benchmark_oriented_cuboids.py \
-  --manifest benchmark/primitive_10_objects.csv
+for k in {1..8}; do
+  .venv/bin/python benchmark/scripts/benchmark_k_oriented_cuboids.py \
+    --manifest benchmark/primitive_10_objects.csv --k "$k"
+done
+```
+
+Then build all superquadric fits with:
+
+```sh
+for k in {1..8}; do
+  .venv/bin/python benchmark/scripts/benchmark_superquadrics.py --k "$k"
+done
 ```
 
 ## What we have checked

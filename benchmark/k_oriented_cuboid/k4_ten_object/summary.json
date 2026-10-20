@@ -13,6 +13,6 @@
   "chamfer_definition": "symmetric mean squared nearest-neighbor distance",
   "mean_chamfer_squared": 0.0063887903,
   "median_chamfer_squared": 0.005318152,
-  "total_fit_seconds": 0.153619751,
-  "total_evaluation_seconds": 0.053720292
+  "total_fit_seconds": 0.150392625,
+  "total_evaluation_seconds": 0.052302334
 }
