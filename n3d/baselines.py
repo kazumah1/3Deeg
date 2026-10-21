@@ -5,6 +5,7 @@ Geometry-only (no EEG):
   same_category_mean      mean CD to the category's training objects     (what category alone buys)
   category_medoid         CD to the category's medoid training object    (best fixed template per category)
   nearest_train_same_cat  CD to the closest training object of the category (oracle retrieval)
+  global_medoid           CD to one fixed training object for every input  (what no information buys)
 With an encoder run (uses its embeddings.npz from `n3d.encoder embed`):
   classify_then_template  predict category from EEG, output that category's medoid
   retrieve_then_copy      nearest training object by f_g . CLIP(video), copied as the output
@@ -41,6 +42,14 @@ def medoids(b, train_objs) -> dict[int, int]:
     return out
 
 
+def global_medoid(b, train_objs, candidates, n_pts=2048, seed=0) -> int:
+    """Candidate with the lowest mean CD to all training objects (subsampled clouds for speed)."""
+    rng = np.random.default_rng(seed)
+    sub = {int(o): b.points[o][rng.choice(len(b.points[o]), n_pts, replace=False)] for o in train_objs}
+    scores = [np.mean([chamfer_np(sub[int(c)], sub[int(t)])["cd"] for t in train_objs]) for c in candidates]
+    return int(candidates[int(np.argmin(scores))])
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", required=True)
@@ -56,6 +65,7 @@ def main(argv=None):
     train, test = s["train"], s["test"]
     rng = np.random.default_rng(0)
     med = medoids(b, train)
+    gmed = global_medoid(b, train, np.array(sorted(med.values())))
     rows = []
     for o in test:
         c = int(b.obj_cat[o])
@@ -69,6 +79,7 @@ def main(argv=None):
             "same_category_mean": float(np.mean(same_cd)),
             "category_medoid": chamfer_np(b.points[o], b.points[med[c]])["cd"],
             "nearest_train_same_cat": float(np.min(same_cd)),
+            "global_medoid": chamfer_np(b.points[o], b.points[gmed])["cd"],
         })
 
     if args.encoder_run:
