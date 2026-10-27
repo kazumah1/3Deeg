@@ -1,0 +1,157 @@
+"""How much category information is linearly decodable from the EEG, and do encoder seeds add up?
+
+linear     Multinomial logistic regression on time-binned EEG (no deep model). If this matches
+           the deep encoder's ~5% top-1, the ceiling is the data, not the architecture.
+           Features: per-channel means in fixed time bins of both streams, z-scored per
+           participant on that participant's training trials. C is picked on val NLL.
+           Test uses repeat-averaged EEG per (participant, object), like the encoder.
+ensemble   Average the softmax of several encoder runs' test logits (from `n3d.encoder embed`).
+
+    python -m n3d.probe linear --run lin_sub01
+    python -m n3d.probe linear --run lin_multi5 --participants sub01 sub02 sub03 sub04 sub05
+    python -m n3d.probe ensemble --run ens_sub01 --encoder-runs enc_sub01 enc_sub01_s1 enc_sub01_s2
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+
+from . import config
+from .data import load_bundle, make_splits
+from .encoder import run_dir
+
+
+def bin_means(x: np.ndarray, n_bins: int) -> np.ndarray:
+    """(T, C, L) -> (T, C * n_bins), mean over equal time bins (tail samples dropped)."""
+    T, C, L = x.shape
+    w = L // n_bins
+    return x[:, :, : w * n_bins].reshape(T, C, n_bins, w).mean(-1).reshape(T, C * n_bins)
+
+
+def features(b, dyn_bins: int, stat_bins: int, streams: str) -> np.ndarray:
+    parts = []
+    if streams in ("both", "dyn"):
+        parts.append(bin_means(b.dyn, dyn_bins))
+    if streams in ("both", "stat"):
+        parts.append(bin_means(b.stat, stat_bins))
+    return np.concatenate(parts, 1).astype(np.float32)
+
+
+def averaged(X: np.ndarray, b, objs: np.ndarray):
+    """One row per (participant, object): mean of that object's repeats."""
+    rows, y, sub, obj = [], [], [], []
+    for s in np.unique(b.trial_sub):
+        for o in objs:
+            t = np.flatnonzero((b.trial_sub == s) & (b.trial_obj == o))
+            if len(t):
+                rows.append(X[t].mean(0)); y.append(b.obj_cat[o]); sub.append(s); obj.append(o)
+    return np.stack(rows), np.array(y), np.array(sub), np.array(obj)
+
+
+def topk(P: np.ndarray, y: np.ndarray, k: int) -> float:
+    return float((np.argsort(-P, 1)[:, :k] == y[:, None]).any(1).mean())
+
+
+def metrics(P: np.ndarray, y: np.ndarray, n_classes: int) -> dict:
+    from scipy.stats import binomtest
+    n = len(y)
+    out = {"n": n, "top1": topk(P, y, 1), "top5": topk(P, y, 5),
+           "nll": float(-np.log(np.clip(P[np.arange(n), y], 1e-12, None)).mean())}
+    out["p_top1"] = float(binomtest(round(out["top1"] * n), n, 1 / n_classes, alternative="greater").pvalue)
+    out["p_top5"] = float(binomtest(round(out["top5"] * n), n, 5 / n_classes, alternative="greater").pvalue)
+    return out
+
+
+def cmd_linear(args):
+    from sklearn.linear_model import LogisticRegression
+    b = load_bundle(args.data_root, tuple(args.participants), args.geometry)
+    s = make_splits(b, args.split)
+    X = features(b, args.dyn_bins, args.stat_bins, args.streams)
+    tr = np.isin(b.trial_obj, s["train"])
+    for sub in np.unique(b.trial_sub):  # z-score per participant on its own training trials
+        m = b.trial_sub == sub
+        mu, sd = X[m & tr].mean(0), X[m & tr].std(0) + 1e-6
+        X[m] = (X[m] - mu) / sd
+    Xtr, ytr = X[tr], b.obj_cat[b.trial_obj[tr]]
+    if args.train_on == "averaged":
+        Xtr, ytr, _, _ = averaged(X, b, s["train"])
+    Xva, yva, _, _ = averaged(X, b, s["val"])
+    Xte, yte, ste, _ = averaged(X, b, s["test"])
+    K = len(b.categories)
+    print(f"features {X.shape[1]}  train rows {len(Xtr)}  val {len(Xva)}  test {len(Xte)}")
+    results, best = [], None
+    for C in args.Cs:
+        clf = LogisticRegression(C=C, max_iter=2000).fit(Xtr, ytr)
+        full = lambda Z: _full_proba(clf, Z, K)
+        rec = {"C": C, "train": metrics(full(Xtr), ytr, K), "val": metrics(full(Xva), yva, K)}
+        results.append(rec)
+        print(f"C {C:g}: train top1 {rec['train']['top1']:.3f} | val top1 {rec['val']['top1']:.3f} "
+              f"top5 {rec['val']['top5']:.3f} nll {rec['val']['nll']:.3f}")
+        if best is None or rec["val"]["nll"] < best[0]["val"]["nll"]:
+            best = (rec, clf)
+    rec, clf = best
+    P = _full_proba(clf, Xte, K)
+    test = {"all": metrics(P, yte, K)}
+    for sub in np.unique(ste):
+        test[args.participants[sub]] = metrics(P[ste == sub], yte[ste == sub], K)
+    out = {"chance_top1": 1 / K, "chance_top5": 5 / K, "uniform_nll": float(np.log(K)),
+           "selected_C": rec["C"], "sweep": results, "test": test, "args": {k: str(v) for k, v in vars(args).items()}}
+    (run_dir(args.run) / "linear_probe.json").write_text(json.dumps(out, indent=1))
+    for k, m in test.items():
+        print(f"test {k:6s} n {m['n']:4d}  top1 {m['top1']:.3f} (p={m['p_top1']:.2g})  "
+              f"top5 {m['top5']:.3f} (p={m['p_top5']:.2g})  nll {m['nll']:.3f}")
+    print(f"chance top1 {1 / K:.3f} top5 {5 / K:.3f} uniform nll {np.log(K):.3f}")
+
+
+def _full_proba(clf, Z: np.ndarray, K: int) -> np.ndarray:
+    P = np.full((len(Z), K), 1e-12)
+    P[:, clf.classes_] = clf.predict_proba(Z)
+    return P / P.sum(1, keepdims=True)
+
+
+def cmd_ensemble(args):
+    b = load_bundle(args.data_root, ("sub01",), args.geometry)
+    probs, objs = [], None
+    for r in args.encoder_runs:
+        e = np.load(run_dir(r) / "embeddings.npz")
+        o = e["test_avg_obj"]
+        if objs is None:
+            objs = o
+        assert np.array_equal(o, objs), f"{r}: test objects differ; re-run `n3d.encoder embed` on the same data"
+        lg = e["test_avg_shape_logits"]
+        lg = lg - lg.max(1, keepdims=True)
+        probs.append(np.exp(lg) / np.exp(lg).sum(1, keepdims=True))
+    y, K = b.obj_cat[objs], probs[0].shape[1]
+    out = {r: metrics(p, y, K) for r, p in zip(args.encoder_runs, probs)}
+    out["ensemble"] = metrics(np.mean(probs, 0), y, K)
+    (run_dir(args.run) / "ensemble.json").write_text(json.dumps(out, indent=1))
+    for k, m in out.items():
+        print(f"{k:16s} top1 {m['top1']:.3f} (p={m['p_top1']:.2g})  top5 {m['top5']:.3f}  nll {m['nll']:.3f}")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("linear", "ensemble"):
+        p = sub.add_parser(name)
+        p.add_argument("--run", required=True)
+        p.add_argument("--data-root", type=Path, default=None)
+        p.add_argument("--geometry", default="point_cloud_simple")
+    lin = sub.choices["linear"]
+    lin.add_argument("--participants", nargs="+", default=["sub01"])
+    lin.add_argument("--split", default="ours", choices=list(config.SPLITS))
+    lin.add_argument("--streams", default="both", choices=["both", "dyn", "stat"])
+    lin.add_argument("--dyn-bins", type=int, default=30, help="6 s at 100 Hz -> 200 ms bins")
+    lin.add_argument("--stat-bins", type=int, default=25, help="1 s at 250 Hz -> 40 ms bins")
+    lin.add_argument("--train-on", default="trials", choices=["trials", "averaged"])
+    lin.add_argument("--Cs", type=float, nargs="+", default=[1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2])
+    sub.choices["ensemble"].add_argument("--encoder-runs", nargs="+", required=True)
+    args = ap.parse_args(argv)
+    {"linear": cmd_linear, "ensemble": cmd_ensemble}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
