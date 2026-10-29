@@ -34,12 +34,22 @@ def bin_means(x: np.ndarray, n_bins: int) -> np.ndarray:
     return x[:, :, : w * n_bins].reshape(T, C, n_bins, w).mean(-1).reshape(T, C * n_bins)
 
 
-def features(b, dyn_bins: int, stat_bins: int, streams: str) -> np.ndarray:
+def crop(x: np.ndarray, hz: int, ms: tuple[float, float] | None) -> np.ndarray:
+    if not ms:
+        return x
+    a, z = round(ms[0] * hz / 1000), round(ms[1] * hz / 1000)
+    return x[:, :, a:z]
+
+
+def features(b, dyn_bins: int, stat_bins: int, streams: str, dyn_ms=None, stat_ms=None) -> np.ndarray:
+    """Bin widths stay those of the full epoch (dyn 600/dyn_bins samples, stat 250/stat_bins) when cropping."""
     parts = []
     if streams in ("both", "dyn"):
-        parts.append(bin_means(b.dyn, dyn_bins))
+        x = crop(b.dyn, 100, dyn_ms)
+        parts.append(bin_means(x, max(1, x.shape[2] // (b.dyn.shape[2] // dyn_bins))))
     if streams in ("both", "stat"):
-        parts.append(bin_means(b.stat, stat_bins))
+        x = crop(b.stat, 250, stat_ms)
+        parts.append(bin_means(x, max(1, x.shape[2] // (b.stat.shape[2] // stat_bins))))
     return np.concatenate(parts, 1).astype(np.float32)
 
 
@@ -72,7 +82,7 @@ def cmd_linear(args):
     from sklearn.linear_model import LogisticRegression
     b = load_bundle(args.data_root, tuple(args.participants), args.geometry)
     s = make_splits(b, args.split)
-    X = features(b, args.dyn_bins, args.stat_bins, args.streams)
+    X = features(b, args.dyn_bins, args.stat_bins, args.streams, args.dyn_ms, args.stat_ms)
     tr = np.isin(b.trial_obj, s["train"])
     X = zscore_per_subject(X, b, s["train"])  # per participant, on its own training trials
     Xtr, ytr = X[tr], b.obj_cat[b.trial_obj[tr]]
@@ -179,6 +189,8 @@ def main(argv=None):
     lin.add_argument("--streams", default="both", choices=["both", "dyn", "stat"])
     lin.add_argument("--dyn-bins", type=int, default=30, help="6 s at 100 Hz -> 200 ms bins")
     lin.add_argument("--stat-bins", type=int, default=25, help="1 s at 250 Hz -> 40 ms bins")
+    lin.add_argument("--dyn-ms", type=float, nargs=2, default=None, help="crop the dynamic epoch, e.g. 0 1000")
+    lin.add_argument("--stat-ms", type=float, nargs=2, default=None, help="crop the static epoch, e.g. 240 920")
     lin.add_argument("--train-on", default="trials", choices=["trials", "averaged"])
     lin.add_argument("--Cs", type=float, nargs="+", default=[1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2])
     tc = sub.choices["timecourse"]
