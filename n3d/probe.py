@@ -5,10 +5,13 @@ linear     Multinomial logistic regression on time-binned EEG (no deep model). I
            Features: per-channel means in fixed time bins of both streams, z-scored per
            participant on that participant's training trials. C is picked on val NLL.
            Test uses repeat-averaged EEG per (participant, object), like the encoder.
+timecourse Same linear probe on short sliding windows of one stream: which time windows
+           carry category information (e.g. the 100-300 ms visual response in the static stream)?
 ensemble   Average the softmax of several encoder runs' test logits (from `n3d.encoder embed`).
 
     python -m n3d.probe linear --run lin_sub01
     python -m n3d.probe linear --run lin_multi5 --participants sub01 sub02 sub03 sub04 sub05
+    python -m n3d.probe timecourse --run tc_multi5 --participants sub01 sub02 sub03 sub04 sub05 --stream stat
     python -m n3d.probe ensemble --run ens_sub01 --encoder-runs enc_sub01 enc_sub01_s1 enc_sub01_s2
 """
 from __future__ import annotations
@@ -71,10 +74,7 @@ def cmd_linear(args):
     s = make_splits(b, args.split)
     X = features(b, args.dyn_bins, args.stat_bins, args.streams)
     tr = np.isin(b.trial_obj, s["train"])
-    for sub in np.unique(b.trial_sub):  # z-score per participant on its own training trials
-        m = b.trial_sub == sub
-        mu, sd = X[m & tr].mean(0), X[m & tr].std(0) + 1e-6
-        X[m] = (X[m] - mu) / sd
+    X = zscore_per_subject(X, b, s["train"])  # per participant, on its own training trials
     Xtr, ytr = X[tr], b.obj_cat[b.trial_obj[tr]]
     if args.train_on == "averaged":
         Xtr, ytr, _, _ = averaged(X, b, s["train"])
@@ -106,6 +106,39 @@ def cmd_linear(args):
     print(f"chance top1 {1 / K:.3f} top5 {5 / K:.3f} uniform nll {np.log(K):.3f}")
 
 
+def zscore_per_subject(X: np.ndarray, b, train_objs: np.ndarray) -> np.ndarray:
+    tr = np.isin(b.trial_obj, train_objs)
+    for sub in np.unique(b.trial_sub):
+        m = b.trial_sub == sub
+        mu, sd = X[m & tr].mean(0), X[m & tr].std(0) + 1e-6
+        X[m] = (X[m] - mu) / sd
+    return X
+
+
+def cmd_timecourse(args):
+    from sklearn.linear_model import LogisticRegression
+    b = load_bundle(args.data_root, tuple(args.participants), args.geometry)
+    s = make_splits(b, args.split)
+    raw, hz = (b.stat, 250) if args.stream == "stat" else (b.dyn, 100)
+    win, step = round(args.window_ms * hz / 1000), round(args.step_ms * hz / 1000)
+    sub_bins = max(1, win // max(1, round(args.subbin_ms * hz / 1000)))
+    tr = np.isin(b.trial_obj, s["train"])
+    K, rows = len(b.categories), []
+    print(f"{args.stream}: {raw.shape[2]} samples @ {hz} Hz, window {args.window_ms} ms, step {args.step_ms} ms, C {args.C}")
+    for start in range(0, raw.shape[2] - win + 1, step):
+        X = zscore_per_subject(bin_means(raw[:, :, start:start + win], sub_bins).astype(np.float32), b, s["train"])
+        clf = LogisticRegression(C=args.C, max_iter=2000).fit(X[tr], b.obj_cat[b.trial_obj[tr]])
+        Xte, yte, _, _ = averaged(X, b, s["test"])
+        m = metrics(_full_proba(clf, Xte, K), yte, K)
+        m |= {"start_ms": 1000 * start / hz, "end_ms": 1000 * (start + win) / hz}
+        rows.append(m)
+        print(f"{m['start_ms']:6.0f}-{m['end_ms']:6.0f} ms  top1 {m['top1']:.3f}  top5 {m['top5']:.3f} "
+              f"(p={m['p_top5']:.2g})  nll {m['nll']:.3f}")
+    (run_dir(args.run) / f"timecourse_{args.stream}.json").write_text(json.dumps(
+        {"chance_top5": 5 / K, "uniform_nll": float(np.log(K)), "windows": rows, "args": {k: str(v) for k, v in vars(args).items()}}, indent=1))
+    print(f"chance top5 {5 / K:.3f}, uniform nll {np.log(K):.3f}; p-values are per window, uncorrected")
+
+
 def _full_proba(clf, Z: np.ndarray, K: int) -> np.ndarray:
     P = np.full((len(Z), K), 1e-12)
     P[:, clf.classes_] = clf.predict_proba(Z)
@@ -135,7 +168,7 @@ def cmd_ensemble(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("linear", "ensemble"):
+    for name in ("linear", "timecourse", "ensemble"):
         p = sub.add_parser(name)
         p.add_argument("--run", required=True)
         p.add_argument("--data-root", type=Path, default=None)
@@ -148,9 +181,17 @@ def main(argv=None):
     lin.add_argument("--stat-bins", type=int, default=25, help="1 s at 250 Hz -> 40 ms bins")
     lin.add_argument("--train-on", default="trials", choices=["trials", "averaged"])
     lin.add_argument("--Cs", type=float, nargs="+", default=[1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2])
+    tc = sub.choices["timecourse"]
+    tc.add_argument("--participants", nargs="+", default=["sub01"])
+    tc.add_argument("--split", default="ours", choices=list(config.SPLITS))
+    tc.add_argument("--stream", default="stat", choices=["stat", "dyn"])
+    tc.add_argument("--window-ms", type=float, default=100)
+    tc.add_argument("--step-ms", type=float, default=50)
+    tc.add_argument("--subbin-ms", type=float, default=20, help="feature resolution inside a window")
+    tc.add_argument("--C", type=float, default=1e-3)
     sub.choices["ensemble"].add_argument("--encoder-runs", nargs="+", required=True)
     args = ap.parse_args(argv)
-    {"linear": cmd_linear, "ensemble": cmd_ensemble}[args.cmd](args)
+    {"linear": cmd_linear, "timecourse": cmd_timecourse, "ensemble": cmd_ensemble}[args.cmd](args)
 
 
 if __name__ == "__main__":
