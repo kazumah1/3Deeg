@@ -233,14 +233,38 @@ def cmd_sample(args):
     sched = ddpm if args.steps >= 1000 else ddim
     ds = EEG3D(b, splits[args.eval_split], train=False)
     preds, gts, objs = [], [], []
+    ranked = None  # (object -> categories ranked by decoded probability), for --cat-probs
+    if args.cat_probs:
+        if args.cond_source != "category":
+            raise SystemExit("--cat-probs needs a model trained with --cond-source category")
+        z = np.load(args.cat_probs)
+        ranked = {int(o): np.argsort(-p) for o, p in zip(z["obj"], z["probs"])}
+        probs = {int(o): p for o, p in zip(z["obj"], z["probs"])}
+    rng = np.random.default_rng(0)
     for batch in DataLoader(ds, batch_size=args.batch_size):
-        c = cond(batch, dev)
         per = []
         for k in range(args.samples):
+            if ranked is not None:  # replace the true label with a category decoded from the EEG
+                o = [int(x) for x in batch["obj"]]
+                if args.cat_mode == "top1":
+                    cats = [ranked[i][0] for i in o]
+                elif args.cat_mode == "topk":
+                    cats = [ranked[i][k] for i in o]
+                else:
+                    cats = [rng.choice(len(probs[i]), p=probs[i] / probs[i].sum()) for i in o]
+                batch = {**batch, "cat": torch.as_tensor(np.array(cats))}
+            c = cond(batch, dev)
+            if args.cond_override == "zeros":
+                c = torch.zeros_like(c)
             g = torch.Generator(device=dev).manual_seed(1000 + k)
             per.append(sample(net, c, sched, steps=args.steps, generator=g).cpu())
         preds.append(torch.stack(per, 1)); gts.append(batch["points"]); objs.append(torch.as_tensor(batch["obj"]))
     P, G, O = torch.cat(preds), torch.cat(gts), torch.cat(objs)
+    out = run_dir(args.run)
+    tag = args.tag or ("zeros" if args.cond_override == "zeros" else (f"cat{args.cat_mode}" if args.cat_probs else ""))
+    tag = f"_{tag}" if tag else ""
+    # save the clouds before scoring, so a scoring failure never loses the samples
+    np.savez_compressed(out / f"pred_{args.eval_split}_k{args.samples}_s{args.steps}{tag}.npz", pred=P.numpy(), gt=G.numpy(), obj=O.numpy())
     rows = []
     for k in range(args.samples):
         for o, m in zip(O.tolist(), chamfer_torch(P[:, k].to(dev), G.to(dev))):
@@ -249,9 +273,8 @@ def cmd_sample(args):
     summary = {"split": args.eval_split, "n_objects": int(len(O)), "samples": args.samples, "steps": args.steps,
                "cd_mean_over_samples": float(cd.mean()), "cd_best_of_k": float(cd.min(0).mean()),
                "f@0.02_mean": float(np.mean([r["f@0.02"] for r in rows]))}
-    out = run_dir(args.run)
-    np.savez_compressed(out / f"pred_{args.eval_split}_k{args.samples}_s{args.steps}.npz", pred=P.numpy(), gt=G.numpy(), obj=O.numpy())
-    (out / f"eval_{args.eval_split}_k{args.samples}_s{args.steps}.json").write_text(json.dumps({"summary": summary, "rows": rows}))
+    summary["tag"] = tag
+    (out / f"eval_{args.eval_split}_k{args.samples}_s{args.steps}{tag}.json").write_text(json.dumps({"summary": summary, "rows": rows}))
     print(json.dumps(summary, indent=1))
 
 
@@ -331,6 +354,13 @@ def main(argv=None):
         p.add_argument("--steps", type=int, default=100, help="DDIM steps; >=1000 uses full DDPM")
         p.add_argument("--samples", type=int, default=5)
         p.add_argument("--batch-size", type=int, default=24)
+        p.add_argument("--cond-override", default="none", choices=["none", "zeros"],
+                       help="sample only: 'zeros' replaces the condition (the no-information floor)")
+        p.add_argument("--cat-probs", type=Path, default=None,
+                       help="sample only, category-conditioned models: npz with obj, probs (from n3d.probe ensemble)")
+        p.add_argument("--cat-mode", default="topk", choices=["top1", "topk", "sample"],
+                       help="top1: most probable category for every sample; topk: sample k uses the k-th ranked; sample: draw from probs")
+        p.add_argument("--tag", default="", help="sample only: suffix for the output files")
     args = ap.parse_args(argv)
     if args.cmd == "train" and args.cond_source == "eeg" and not args.encoder_run:
         ap.error("--encoder-run is required with --cond-source eeg")

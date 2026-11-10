@@ -155,24 +155,51 @@ def _full_proba(clf, Z: np.ndarray, K: int) -> np.ndarray:
     return P / P.sum(1, keepdims=True)
 
 
+def _softmax(lg: np.ndarray) -> np.ndarray:
+    lg = lg - lg.max(1, keepdims=True)
+    return np.exp(lg) / np.exp(lg).sum(1, keepdims=True)
+
+
 def cmd_ensemble(args):
+    """Average seeds, then fuse two views of the same EEG (a product of experts):
+      classifier   mean softmax of the encoders' 72-way heads
+      clip         cosine similarity of the mean predicted CLIP embedding f_g to each category's
+                   mean CLIP embedding (training objects only), as logits a * cos
+      fused        log p_classifier + a * cos, renormalised; `a` is picked on validation NLL
+    Writes ensemble_probs.npz (obj, probs = fused test probabilities) for
+    `n3d.diffusion sample --cat-probs`."""
     b = load_bundle(args.data_root, ("sub01",), args.geometry)
-    probs, objs = [], None
-    for r in args.encoder_runs:
-        e = np.load(run_dir(r) / "embeddings.npz")
-        o = e["test_avg_obj"]
-        if objs is None:
-            objs = o
-        assert np.array_equal(o, objs), f"{r}: test objects differ; re-run `n3d.encoder embed` on the same data"
-        lg = e["test_avg_shape_logits"]
-        lg = lg - lg.max(1, keepdims=True)
-        probs.append(np.exp(lg) / np.exp(lg).sum(1, keepdims=True))
-    y, K = b.obj_cat[objs], probs[0].shape[1]
-    out = {r: metrics(p, y, K) for r, p in zip(args.encoder_runs, probs)}
-    out["ensemble"] = metrics(np.mean(probs, 0), y, K)
+    E = [np.load(run_dir(r) / "embeddings.npz") for r in args.encoder_runs]
+    K = E[0]["test_avg_shape_logits"].shape[1]
+    out, parts = {}, {}
+    for split in ("val", "test"):
+        objs = E[0][f"{split}_avg_obj"]
+        for r, e in zip(args.encoder_runs, E):
+            assert np.array_equal(e[f"{split}_avg_obj"], objs), f"{r}: {split} objects differ; re-run `n3d.encoder embed`"
+        p_cls = np.mean([_softmax(e[f"{split}_avg_shape_logits"]) for e in E], 0)
+        f = np.mean([e[f"{split}_avg_f_g"] for e in E], 0)
+        parts[split] = (objs, b.obj_cat[objs], p_cls, f)
+    train = make_splits(b, "ours")["train"]
+    cat_mean = np.stack([b.clip_video[train][b.obj_cat[train] == c].mean(0) for c in range(K)])
+    unit = lambda x: x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-9)
+    cos = {s: unit(parts[s][3]) @ unit(cat_mean).T for s in parts}
+    nll = lambda P, y: float(-np.log(np.clip(P[np.arange(len(y)), y], 1e-12, None)).mean())
+    _, yv, pv, _ = parts["val"]
+    a_clip = min(args.scales, key=lambda a: nll(_softmax(a * cos["val"]), yv))
+    a_fuse = min([0.0] + list(args.scales), key=lambda a: nll(_softmax(np.log(pv + 1e-12) + a * cos["val"]), yv))
+    objs, y, p_cls, _ = parts["test"]
+    for r, e in zip(args.encoder_runs, E):
+        out[r] = metrics(_softmax(e["test_avg_shape_logits"]), y, K)
+    out["ensemble_classifier"] = metrics(p_cls, y, K)
+    out["clip_similarity"] = metrics(_softmax(a_clip * cos["test"]), y, K) | {"scale": a_clip}
+    fused = _softmax(np.log(p_cls + 1e-12) + a_fuse * cos["test"])
+    out["fused"] = metrics(fused, y, K) | {"scale": a_fuse}
     (run_dir(args.run) / "ensemble.json").write_text(json.dumps(out, indent=1))
+    np.savez(run_dir(args.run) / "ensemble_probs.npz", obj=objs, probs=fused, probs_classifier=p_cls)
     for k, m in out.items():
-        print(f"{k:16s} top1 {m['top1']:.3f} (p={m['p_top1']:.2g})  top5 {m['top5']:.3f}  nll {m['nll']:.3f}")
+        extra = f"  scale {m['scale']:g}" if "scale" in m else ""
+        print(f"{k:20s} top1 {m['top1']:.3f} (p={m['p_top1']:.2g})  top5 {m['top5']:.3f}  nll {m['nll']:.3f}{extra}")
+    print(f"wrote {run_dir(args.run) / 'ensemble_probs.npz'} (fused probabilities; scale 0 = classifier only)")
 
 
 def main(argv=None):
@@ -202,6 +229,7 @@ def main(argv=None):
     tc.add_argument("--subbin-ms", type=float, default=20, help="feature resolution inside a window")
     tc.add_argument("--C", type=float, default=1e-3)
     sub.choices["ensemble"].add_argument("--encoder-runs", nargs="+", required=True)
+    sub.choices["ensemble"].add_argument("--scales", type=float, nargs="+", default=[2, 5, 10, 20, 50, 100])
     args = ap.parse_args(argv)
     {"linear": cmd_linear, "timecourse": cmd_timecourse, "ensemble": cmd_ensemble}[args.cmd](args)
 
