@@ -90,10 +90,63 @@ def fetch_weights(local: Path | None) -> tuple[dict, dict]:
         enc, proj = local / "pretrain_Enc_eeg_cls.pth", local / "pretrain_Proj_eeg_cls.pth"
     else:
         from huggingface_hub import hf_hub_download
-        enc = hf_hub_download("eeyhsong/NICE", "pretrain_Enc_eeg_cls.pth")
-        proj = hf_hub_download("eeyhsong/NICE", "pretrain_Proj_eeg_cls.pth")
-    load = lambda p: {k.replace("module.", ""): v for k, v in torch.load(p, map_location="cpu", weights_only=False).items()}
+        rev = "7f98b0832c698cb69f7944eaf5462ffa95f204e7"  # pinned: files inspected at this commit
+        enc = hf_hub_download("eeyhsong/NICE", "pretrain_Enc_eeg_cls.pth", revision=rev)
+        proj = hf_hub_download("eeyhsong/NICE", "pretrain_Proj_eeg_cls.pth", revision=rev)
+    def load(p):
+        try:
+            sd = torch.load(p, map_location="cpu", weights_only=True)
+        except RuntimeError as e:  # the released Enc file is truncated (no zip central directory)
+            print(f"torch.load failed on {Path(p).name} ({str(e).splitlines()[0][:60]}...); salvaging intact tensors")
+            sd = salvage_truncated(Path(p))
+        return {k.replace("module.", ""): v for k, v in sd.items()}
     return load(enc), load(proj)
+
+
+def salvage_truncated(path: Path) -> dict:
+    """Read a torch zip checkpoint that lost its central directory by walking local file headers.
+
+    NICE's pretrain_Enc_eeg_cls.pth on the Hub is 76 kB and cut off inside the spatial conv
+    (shallownet.4.weight); every tensor stored before the cut (temporal conv, its BatchNorm,
+    projection) is complete. Tensors whose bytes are missing or short are dropped."""
+    import io
+    import pickle
+    import re
+
+    b = path.read_bytes()
+    descs = [m.start() for m in re.finditer(rb"PK\x07\x08", b)]
+    ents = {}
+    for m in re.finditer(rb"PK\x03\x04", b):
+        i = m.start()
+        nlen, xlen = (int.from_bytes(b[i + o:i + o + 2], "little") for o in (26, 28))
+        name, s = b[i + 30:i + 30 + nlen].decode(), i + 30 + nlen + xlen
+        ents[name.split("/", 1)[1]] = b[s:next((d for d in descs if d > s), len(b))]
+
+    def rebuild(storage, offset, size, stride, *_):
+        dtype, raw = storage
+        n = int(np.prod(size)) if len(size) else 1
+        el = torch.tensor([], dtype=dtype).element_size()
+        if raw is None or len(raw) < (offset + n) * el:
+            return None
+        flat = torch.frombuffer(bytearray(raw), dtype=dtype)
+        return flat.as_strided(tuple(size), tuple(stride), offset).clone()
+
+    class U(pickle.Unpickler):
+        def persistent_load(self, pid):  # ('storage', FloatStorage, key, location, numel)
+            return pid[1].dtype, ents.get(f"data/{pid[2]}")
+
+        def find_class(self, mod, name):  # allow-list: a state_dict needs only these
+            if name.startswith("_rebuild_tensor"):
+                return rebuild
+            if (mod, name) == ("collections", "OrderedDict") or (mod == "torch" and name.endswith("Storage")):
+                return super().find_class(mod, name)
+            raise pickle.UnpicklingError(f"refusing {mod}.{name} in checkpoint")
+
+    sd = U(io.BytesIO(ents["data.pkl"])).load()
+    dropped = [k for k, v in sd.items() if v is None]
+    if dropped:
+        print(f"  dropped (bytes missing): {dropped}")
+    return {k: v for k, v in sd.items() if v is not None}
 
 
 def load_pretrained(model: NICE, enc_sd: dict, proj_sd: dict, load_proj: bool) -> list[str]:
@@ -101,6 +154,8 @@ def load_pretrained(model: NICE, enc_sd: dict, proj_sd: dict, load_proj: bool) -
     matches. Names in NICE's file look like '0.tsconv.0.weight'; ours are 'enc.0.tsconv.0.weight'."""
     own = model.state_dict()
     loaded = []
+    # the released file names the block 'shallownet' (e.g. '0.shallownet.0.weight'); same layout as tsconv
+    enc_sd = {k.replace("shallownet.", "tsconv."): v for k, v in enc_sd.items()}
     for k, v in enc_sd.items():  # match by the part after 'tsconv.' / 'projection.', whatever the prefix
         for tag in ("tsconv.", "projection."):
             if tag in k:
