@@ -11,4 +11,7 @@ encoder    train / evaluate / probe the upstream EEG encoder
 denoisers  PVCNN (upstream, CUDA) and PointNet (pure torch) noise predictors
 diffusion  train / sample the conditional point-cloud diffusion model
 baselines  geometry-only reference Chamfer scores and classify-then-template
+regress    one-shot MLP decoder trained on Chamfer (mean-shape collapse control)
+sweep      decoder benchmark grid (PVCNN/PointNet x concat/FiLM/xattn + regression) by tier
+aggregate  benchmark results table, mean +- sd over seeds
 """

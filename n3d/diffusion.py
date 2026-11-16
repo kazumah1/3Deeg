@@ -36,7 +36,7 @@ from torch.utils.data import DataLoader
 
 from . import config
 from .data import EEG3D, load_bundle, make_splits
-from .denoisers import build_denoiser
+from .denoisers import COND_MODES, build_denoiser, match_width
 from .ckpt import atomic_save, load_resume, log_line, save_resume, save_snapshot
 from .encoder import device, load_trained, restore_rng, rng_state, run_dir, seed_worker, set_seed
 from .metrics import chamfer_torch
@@ -74,9 +74,13 @@ class Conditioner(nn.Module):
 def build(args, dev, b):
     enc = load_trained(args.encoder_run, dev) if args.cond_source == "eeg" else None
     cond = Conditioner(args.cond_source, enc, b.clip_video).to(dev)
-    kw = {}
     if args.denoiser == "pvcnn":
         kw = dict(width_multiplier=args.width, voxel_resolution_multiplier=args.voxel_res)
+    else:
+        width = args.pn_width
+        if getattr(args, "pn_match_params", None):
+            width = match_width(args.cond_mode, args.pn_match_params, args.pn_depth)
+        kw = dict(width=width, depth=args.pn_depth)
     net = build_denoiser(args.denoiser, cond_dim=1024, cond_mode=args.cond_mode, **kw).to(dev)
     return cond, net
 
@@ -136,11 +140,11 @@ def setup(args):
 
 
 @torch.no_grad()
-def evaluate(net, cond, b, objs, dev, steps, n_eval, seed=0, ddim=None):
+def evaluate(net, cond, b, objs, dev, steps, n_eval, seed=0, ddim=None, n_points=config.N_POINTS):
     ds = EEG3D(b, objs[:n_eval], train=False)
     batch = next(iter(DataLoader(ds, batch_size=len(ds))))
     g = torch.Generator(device=dev).manual_seed(seed)
-    pred = sample(net, cond(batch, dev), ddim, steps=steps, generator=g)
+    pred = sample(net, cond(batch, dev), ddim, n_points=n_points, steps=steps, generator=g)
     m = chamfer_torch(pred, batch["points"].to(dev))
     return {k: float(np.mean([x[k] for x in m])) for k in m[0]}, pred.cpu().numpy(), batch
 
@@ -167,7 +171,9 @@ def train(args):
         print(f"resumed at step {step}")
     n_params = sum(p.numel() for p in net.parameters())
     print(f"denoiser {args.denoiser}/{args.cond_mode}: {n_params/1e6:.2f}M params; cond={args.cond_source}; "
-          f"train objects {len(splits['train'])}, samples {len(ds)}")
+          f"train objects {len(splits['train'])}, samples {len(ds)}, points {args.n_points}")
+    (out / "model.json").write_text(json.dumps({"denoiser_params": n_params, **{k: getattr(net, k) for k in
+                                                ("width",) if hasattr(net, k)}}))
     eval_split = "val" if len(splits.get("val", [])) else "test"
     log = out / "metrics.jsonl"
     alphas = ddpm.alphas_cumprod.to(dev)
@@ -176,6 +182,8 @@ def train(args):
         for batch in loader:
             net.train()
             x0 = batch["points"].to(dev)
+            if args.n_points < x0.shape[1]:  # fresh random subset each step
+                x0 = x0[:, torch.randperm(x0.shape[1], device=dev)[:args.n_points]]
             c = cond(batch, dev)
             if torch.rand(()) > 0.5:
                 c = c + torch.randn_like(c) * 0.004
@@ -186,15 +194,19 @@ def train(args):
             loss = nn.functional.mse_loss(net(x_t, t, c), noise)
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            gn = torch.nn.utils.clip_grad_norm_(net.parameters(), 50.0)
+            gn = torch.nn.utils.clip_grad_norm_([p for p in list(net.parameters()) + list(cond.parameters())
+                                                 if p.requires_grad], 50.0)
             opt.step(); lrs.step(); step += 1
             running.append(loss.item())
             if step % args.log_every == 0:
                 rec = {"step": step, "loss": float(np.mean(running)), "grad_norm": float(gn),
                        "lr": lrs.get_last_lr()[0], "sec_per_step": (time.time() - t0) / args.log_every}
+                if torch.cuda.is_available():
+                    rec["gpu_mem_gb"] = torch.cuda.max_memory_allocated() / 1e9
                 running, t0 = [], time.time()
                 if step % args.eval_every == 0 or step == args.max_steps:
-                    m, pred, batch_e = evaluate(net, cond, b, splits[eval_split], dev, args.eval_steps, args.n_eval, ddim=ddim)
+                    m, pred, batch_e = evaluate(net, cond, b, splits[eval_split], dev, args.eval_steps, args.n_eval,
+                                                ddim=ddim, n_points=args.n_points)
                     rec |= {f"{eval_split}_{k}": v for k, v in m.items()}
                     np.savez_compressed(out / f"samples_step{step:07d}.npz", pred=pred,
                                         gt=batch_e["points"].numpy(), obj=np.asarray(batch_e["obj"]))
@@ -220,6 +232,8 @@ def load_for_inference(args):
     for k in ("denoiser", "cond_mode", "cond_source", "encoder_run", "width", "voxel_res", "geometry",
               "participants", "split", "tiny"):
         setattr(args, k, saved[k])
+    for k, default in (("pn_width", 256), ("pn_depth", 4), ("pn_match_params", None), ("n_points", config.N_POINTS)):
+        setattr(args, k, saved.get(k, default))
     b, splits = setup(args)
     cond, net = build(args, dev, b)
     load_ckpt(run_dir(args.run) / args.ckpt, net, cond, dev)
@@ -257,7 +271,7 @@ def cmd_sample(args):
             if args.cond_override == "zeros":
                 c = torch.zeros_like(c)
             g = torch.Generator(device=dev).manual_seed(1000 + k)
-            per.append(sample(net, c, sched, steps=args.steps, generator=g).cpu())
+            per.append(sample(net, c, sched, n_points=args.n_points, steps=args.steps, generator=g).cpu())
         preds.append(torch.stack(per, 1)); gts.append(batch["points"]); objs.append(torch.as_tensor(batch["obj"]))
     P, G, O = torch.cat(preds), torch.cat(gts), torch.cat(objs)
     out = run_dir(args.run)
@@ -295,7 +309,7 @@ def cmd_swap(args):
     objs, cats = np.asarray(batch["obj"]), np.asarray(batch["cat"])
     rng = np.random.default_rng(0)
     G = batch["points"].to(dev)
-    xT = torch.randn(len(objs), config.N_POINTS, 3, device=dev, generator=torch.Generator(device=dev).manual_seed(7))
+    xT = torch.randn(len(objs), args.n_points, 3, device=dev, generator=torch.Generator(device=dev).manual_seed(7))
     donors = {"own": np.arange(len(objs))}
     donors["sibling"] = np.array([rng.choice(np.flatnonzero((cats == c) & (objs != o))) if ((cats == c) & (objs != o)).any() else i
                                   for i, (o, c) in enumerate(zip(objs, cats))])
@@ -324,7 +338,14 @@ def main(argv=None):
     t.add_argument("--encoder-run", default=None, help="n3d.encoder run providing best.pt (cond-source eeg)")
     t.add_argument("--cond-source", default="eeg", choices=["eeg", "clip", "category"])
     t.add_argument("--denoiser", default="pvcnn", choices=["pvcnn", "pointnet"])
-    t.add_argument("--cond-mode", default="concat", choices=["concat", "film"])
+    t.add_argument("--cond-mode", default="concat", choices=sorted({m for v in COND_MODES.values() for m in v}),
+                   help="pvcnn: concat|film; pointnet: concat|film|xattn")
+    t.add_argument("--pn-width", type=int, default=256, help="pointnet hidden width")
+    t.add_argument("--pn-depth", type=int, default=4, help="pointnet residual blocks")
+    t.add_argument("--pn-match-params", type=int, default=None,
+                   help="pointnet: pick the width giving at least this many parameters (size-matched grids)")
+    t.add_argument("--n-points", type=int, default=config.N_POINTS,
+                   help="points per cloud for training and sampling (random subset of the 8192 each step)")
     t.add_argument("--width", type=float, default=1.0, help="pvcnn width multiplier (Branch B)")
     t.add_argument("--voxel-res", type=float, default=1.0, help="pvcnn voxel resolution multiplier (Branch B)")
     t.add_argument("--data-root", type=Path, default=None)
