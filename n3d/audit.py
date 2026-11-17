@@ -38,13 +38,16 @@ def run_name(prefix: str, p: str, split: str, seed: int) -> str:
     return f"{prefix}_{p}_{split}_s{seed}"
 
 
-def jobs(participants=PARTICIPANTS, seeds=SEEDS, epochs: int = 200, prefix: str = "audit") -> list[Job]:
-    out = []
+def jobs(participants=PARTICIPANTS, seeds=SEEDS, epochs: int = 200, prefix: str = "audit",
+         null: bool = False) -> list[Job]:
+    """null=True: permutation null (--shuffle-train), ours split only. Its ours@test-max row is what
+    picking the best test epoch yields with no EEG-shape signal at all."""
+    out, splits, extra = [], (("ours",) if null else SPLITS), (["--shuffle-train"] if null else [])
     for p in participants:
         cmds = [["python", "-m", "n3d.encoder", "train", "--run", run_name(prefix, p, split, seed),
                  "--participants", p, "--split", split, "--seed", str(seed), "--epochs", str(epochs),
-                 "--keep-snapshots", "1"]
-                for split in SPLITS for seed in seeds]
+                 "--keep-snapshots", "1", *extra]
+                for split in splits for seed in seeds]
         out.append(Job(f"{prefix}_{p}", "enc", cmds))
     return out
 
@@ -105,11 +108,12 @@ def main(argv=None):
     ap.add_argument("--prefix", default="audit")
     ap.add_argument("--print", action="store_true")
     ap.add_argument("--summarize", action="store_true")
+    ap.add_argument("--null", action="store_true", help="permutation-null runs (--shuffle-train)")
     a = ap.parse_args(argv)
     if a.summarize:
         print(summarize(config.default_runs_root(), a.prefix))
         return
-    for j in jobs(tuple(a.participants), tuple(a.seeds), a.epochs, a.prefix):
+    for j in jobs(tuple(a.participants), tuple(a.seeds), a.epochs, a.prefix, a.null):
         print(f"# {j.name}")
         for c in j.cmds:
             print(" ", shlex.join(c))

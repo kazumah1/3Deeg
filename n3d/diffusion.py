@@ -234,11 +234,48 @@ def load_for_inference(args):
         setattr(args, k, saved[k])
     for k, default in (("pn_width", 256), ("pn_depth", 4), ("pn_match_params", None), ("n_points", config.N_POINTS)):
         setattr(args, k, saved.get(k, default))
+    eeg_enc = getattr(args, "eeg_encoder", None)
+    if eeg_enc:  # read the encoder's participants so the EEG trials match the encoder
+        args.participants = json.loads((run_dir(eeg_enc) / "config.json").read_text())["participants"]
     b, splits = setup(args)
     cond, net = build(args, dev, b)
     load_ckpt(run_dir(args.run) / args.ckpt, net, cond, dev)
     net.eval()
+    if eeg_enc:
+        cond = eeg_bridge(eeg_enc, args.eeg_norm, b, splits, dev)
+    if getattr(args, "clip_file", None):  # externally decoded CLIP vectors replace the true ones (cond-source clip)
+        if args.cond_source != "clip":
+            raise SystemExit("--clip-file needs a model trained with --cond-source clip")
+        z = np.load(args.clip_file)
+        cond.clip_table[torch.as_tensor(z["obj"], device=dev)] = torch.as_tensor(z["clip"], device=dev).float()
     return dev, b, splits, cond, net
+
+
+class _Affine(nn.Module):
+    def __init__(self, inner, mu_e, sd_e, mu_c, sd_c):
+        super().__init__()
+        self.inner = inner
+        for k, v in dict(mu_e=mu_e, sd_e=sd_e, mu_c=mu_c, sd_c=sd_c).items():
+            self.register_buffer(k, torch.as_tensor(v, dtype=torch.float32), persistent=False)
+
+    def forward(self, batch, dev):
+        return (self.inner(batch, dev) - self.mu_e) / self.sd_e * self.sd_c + self.mu_c
+
+
+def eeg_bridge(encoder_run: str, norm: str, b, splits, dev) -> nn.Module:
+    """Condition a CLIP-trained decoder on EEG at test time: the frozen encoder's f_g, which
+    is regressed onto CLIP during encoder training. norm="match" maps f_g's per-dimension
+    mean/sd (over training objects, repeats averaged) onto CLIP's; uses no test data."""
+    cond = Conditioner("eeg", load_trained(encoder_run, dev), b.clip_video).to(dev)
+    if norm == "none":
+        return cond
+    fs = []
+    with torch.no_grad():
+        for batch in DataLoader(EEG3D(b, splits["train"], train=False), batch_size=64):
+            fs.append(cond(batch, dev).cpu())
+    f = torch.cat(fs).numpy()
+    c = b.clip_video[np.asarray(splits["train"])]
+    return _Affine(cond, f.mean(0), f.std(0) + 1e-6, c.mean(0), c.std(0) + 1e-6).to(dev)
 
 
 def cmd_sample(args):
@@ -276,6 +313,10 @@ def cmd_sample(args):
     P, G, O = torch.cat(preds), torch.cat(gts), torch.cat(objs)
     out = run_dir(args.run)
     tag = args.tag or ("zeros" if args.cond_override == "zeros" else (f"cat{args.cat_mode}" if args.cat_probs else ""))
+    if args.eeg_encoder and not args.tag:
+        tag = f"eeg_{args.eeg_encoder}_{args.eeg_norm}"
+    if getattr(args, "clip_file", None) and not args.tag:
+        tag = "cf_" + Path(args.clip_file).stem
     tag = f"_{tag}" if tag else ""
     # save the clouds before scoring, so a scoring failure never loses the samples
     np.savez_compressed(out / f"pred_{args.eval_split}_k{args.samples}_s{args.steps}{tag}.npz", pred=P.numpy(), gt=G.numpy(), obj=O.numpy())
@@ -382,6 +423,12 @@ def main(argv=None):
         p.add_argument("--cat-mode", default="topk", choices=["top1", "topk", "sample"],
                        help="top1: most probable category for every sample; topk: sample k uses the k-th ranked; sample: draw from probs")
         p.add_argument("--tag", default="", help="sample only: suffix for the output files")
+        p.add_argument("--eeg-encoder", default=None,
+                       help="replace the trained condition with this encoder run's EEG output (CLIP-space bridge)")
+        p.add_argument("--clip-file", type=Path, default=None,
+                       help="npz (obj, clip) of decoded CLIP vectors for test objects, e.g. from n3d.attr_probe export")
+        p.add_argument("--eeg-norm", default="match", choices=["none", "match"],
+                       help="with --eeg-encoder: map f_g's train-set per-dim mean/sd onto CLIP's")
     args = ap.parse_args(argv)
     if args.cmd == "train" and args.cond_source == "eeg" and not args.encoder_run:
         ap.error("--encoder-run is required with --cond-source eeg")

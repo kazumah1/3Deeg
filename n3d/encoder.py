@@ -187,6 +187,10 @@ def train(args):
     set_seed(args.seed)
     dev, out_dir = device(), run_dir(args.run)
     b, splits = setup(args)
+    if args.shuffle_train:  # permutation null: each train object's EEG trials relabelled as another train object
+        tr = np.asarray(splits["train"])
+        m = dict(zip(tr.tolist(), tr[np.random.default_rng(args.seed + 999).permutation(len(tr))].tolist()))
+        b.trial_obj = np.array([m.get(int(o), int(o)) for o in b.trial_obj])
     (out_dir / "config.json").write_text(json.dumps(vars(args) | {"splits": {k: len(v) for k, v in splits.items()}},
                                                     indent=1, default=str))
     train_ds = EEG3D(b, splits["train"], train=True, seed=args.seed)
@@ -407,6 +411,18 @@ def export(args):
     print(f"wrote {path}: {sorted(out)}")
 
 
+def catprobs(args):
+    """Softmax over the 72 shape logits per test object (repeats averaged), for diffusion sample --cat-probs."""
+    dev = device()
+    b, splits = setup(args)
+    e = embed(load_trained(args.run, dev, args.ckpt), EEG3D(b, splits[args.eval_split], train=False), dev)
+    lg = e["shape_logits"] - e["shape_logits"].max(1, keepdims=True)
+    p = np.exp(lg); p /= p.sum(1, keepdims=True)
+    path = run_dir(args.run) / f"cat_probs_{args.eval_split}.npz"
+    np.savez_compressed(path, obj=e["obj"], probs=p, cat=e["cat"])
+    print(f"wrote {path}: top1 {float((p.argmax(1) == e['cat']).mean()):.4f} over {len(p)} objects")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -416,6 +432,8 @@ def main(argv=None):
     t.add_argument("--lr", type=float, default=1e-3)
     t.add_argument("--eval-every", type=int, default=1)
     t.add_argument("--restart", action="store_true", help="ignore existing checkpoints")
+    t.add_argument("--shuffle-train", action="store_true",
+                   help="permutation null: train on EEG paired with the wrong (train) objects")
     t.add_argument("--zero-stream", default="none", choices=["none", "dyn", "stat"],
                    help="train a single-stream encoder: 'stat' zeroes the static input (dynamic-only model)")
     t.add_argument("--select", default="shape_nll", choices=["shape_nll", "shape_top5", "shape_top1", "retr_cat_top1"],
@@ -425,8 +443,11 @@ def main(argv=None):
     for name in ("diagnose", "embed"):
         p = sub.add_parser(name); common_args(p)
         p.add_argument("--ckpt", default="best.pt")
+    c = sub.add_parser("catprobs"); common_args(c)
+    c.add_argument("--ckpt", default="best.pt")
+    c.add_argument("--eval-split", default="test", choices=["val", "test"])
     args = ap.parse_args(argv)
-    {"train": train, "diagnose": diagnose, "embed": export}[args.cmd](args)
+    {"train": train, "diagnose": diagnose, "embed": export, "catprobs": catprobs}[args.cmd](args)
 
 
 if __name__ == "__main__":

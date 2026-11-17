@@ -163,16 +163,91 @@ def aggregate(prefix: str = "bench", baselines: str = "", tag: str = ""):
 
 @app.local_entrypoint()
 def audit(participants: str = "sub01 sub02 sub03 sub04 sub05", seeds: str = "0 1", epochs: int = 200,
-          prefix: str = "audit", gpu: str = DEFAULT_GPU, summarize: bool = False):
+          prefix: str = "audit", gpu: str = DEFAULT_GPU, summarize: bool = False, null: bool = False):
     """Encoder replication audit (n3d.audit): one deployed GPU job per participant. --summarize prints the table."""
     if summarize:
         print(run_cpu.remote(["python", "-m", "n3d.audit", "--summarize", "--prefix", prefix]))
         return
     from n3d import audit as au
-    js = au.jobs(tuple(participants.split()), tuple(int(s) for s in seeds.split()), epochs, prefix)
+    js = au.jobs(tuple(participants.split()), tuple(int(s) for s in seeds.split()), epochs, prefix, null)
     fn = modal.Function.from_name("n3d", "run_job").with_options(gpu=gpu)
     ids = {j.name: fn.spawn(j.name, j.cmds).object_id for j in js}
     out = ROOT / "runs" / f"calls_{prefix}.json"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps(ids, indent=1))
+    print(f"spawned {len(ids)} calls; check: modal run scripts/modal_n3d.py::status --calls {out}")
+
+
+@app.local_entrypoint()
+def bridge(participants: str = "sub01 sub02 sub03 sub04 sub05", encoder_tmpl: str = "audit_{p}_ours_s0",
+           decoders: str = "bench_clip_pn_concat_s0 bench_clip_pn_film_s0 bench_clip_pv_film_s0",
+           norms: str = "match none", steps: int = 100, samples: int = 5, gpu: str = "A10G", prefix: str = "bridge"):
+    """EEG -> CLIP-trained decoder: per participant, sample each decoder from the frozen encoder's f_g
+    (n3d.diffusion sample --eeg-encoder), then identify. One deployed job per participant."""
+    fn = modal.Function.from_name("n3d", "run_job").with_options(gpu=gpu)
+    ids = {}
+    for p in participants.split():
+        enc, cmds = encoder_tmpl.format(p=p), []
+        for dec in decoders.split():
+            for norm in norms.split():
+                cmds.append(["python", "-m", "n3d.diffusion", "sample", "--run", dec, "--samples", str(samples),
+                             "--steps", str(steps), "--eeg-encoder", enc, "--eeg-norm", norm])
+                cmds.append(["python", "-m", "n3d.identify", "--run", dec,
+                             "--file", f"pred_test_k{samples}_s{steps}_eeg_{enc}_{norm}.npz"])
+        ids[f"{prefix}_{p}"] = fn.spawn(f"{prefix}_{p}", cmds).object_id
+    out = ROOT / "runs" / f"calls_{prefix}.json"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps(ids, indent=1))
+    print(f"spawned {len(ids)} calls; check: modal run scripts/modal_n3d.py::status --calls {out}")
+
+
+@app.local_entrypoint()
+def ctg(participants: str = "sub01 sub02 sub03 sub04 sub05", encoder_tmpl: str = "audit_{p}_ours_s0",
+        decoders: str = "bench_category_pn_film_s0 bench_category_pn_concat_s0", modes: str = "topk sample",
+        steps: int = 100, samples: int = 5, gpu: str = "A10G", prefix: str = "ctg"):
+    """Classify, then generate: the frozen encoder's softmax over the 72 categories (encoder catprobs)
+    drives a category-conditioned decoder (diffusion sample --cat-probs), then identify."""
+    fn = modal.Function.from_name("n3d", "run_job").with_options(gpu=gpu)
+    ids = {}
+    for p in participants.split():
+        enc = encoder_tmpl.format(p=p)
+        cmds = [["python", "-m", "n3d.encoder", "catprobs", "--run", enc, "--participants", p]]
+        for dec in decoders.split():
+            for mode in modes.split():
+                tag = f"ctg_{p}_{mode}"
+                cmds.append(["python", "-m", "n3d.diffusion", "sample", "--run", dec, "--samples", str(samples),
+                             "--steps", str(steps), "--cat-probs", f"/runs/{enc}/cat_probs_test.npz",
+                             "--cat-mode", mode, "--tag", tag])
+                cmds.append(["python", "-m", "n3d.identify", "--run", dec,
+                             "--file", f"pred_test_k{samples}_s{steps}_{tag}.npz"])
+        ids[f"{prefix}_{p}"] = fn.spawn(f"{prefix}_{p}", cmds).object_id
+    out = ROOT / "runs" / f"calls_{prefix}.json"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps(ids, indent=1))
+    print(f"spawned {len(ids)} calls; check: modal run scripts/modal_n3d.py::status --calls {out}")
+
+
+@app.local_entrypoint()
+def cpu(args: str):
+    """Run one command on CPU and print its stdout, e.g. --args "python -m n3d.bridge"."""
+    print(run_cpu.remote(shlex.split(args)))
+
+
+@app.local_entrypoint()
+def clipfile(files: str, decoders: str = "bench_clip_pn_concat_s0 bench_clip_pn_film_s0", steps: int = 100,
+             samples: int = 5, gpu: str = "A10G", name: str = "clipfile", src: str = "clippred"):
+    """Sample CLIP-trained decoders from externally decoded CLIP vectors (/runs/<src>/<file>.npz, uploaded with
+    `modal volume put n3d-runs ~/3deeg-runs/clippred clippred`), then identify. One job per decoder."""
+    fn = modal.Function.from_name("n3d", "run_job").with_options(gpu=gpu)
+    ids = {}
+    for dec in decoders.split():
+        cmds = []
+        for f in files.split():
+            cmds.append(["python", "-m", "n3d.diffusion", "sample", "--run", dec, "--samples", str(samples),
+                         "--steps", str(steps), "--clip-file", f"/runs/{src}/{f}.npz"])
+            cmds.append(["python", "-m", "n3d.identify", "--run", dec, "--file", f"pred_test_k{samples}_s{steps}_cf_{f}.npz"])
+        ids[f"{name}_{dec}"] = fn.spawn(f"{name}_{dec}", cmds).object_id
+    out = ROOT / "runs" / f"calls_{name}.json"
     out.parent.mkdir(exist_ok=True)
     out.write_text(json.dumps(ids, indent=1))
     print(f"spawned {len(ids)} calls; check: modal run scripts/modal_n3d.py::status --calls {out}")
