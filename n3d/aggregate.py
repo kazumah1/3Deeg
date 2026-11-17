@@ -28,7 +28,8 @@ def _load(p: Path):
     return json.loads(p.read_text()) if p.exists() else None
 
 
-def collect(root: Path, prefix: str) -> list[dict]:
+def collect(root: Path, prefix: str, tag: str | None = None) -> list[dict]:
+    """tag (e.g. "k5_s100") pins which sampling run to read; default: the last eval file found."""
     rows = []
     for d in sorted(root.glob(f"{prefix}*")):
         if not (d / "config.json").exists():
@@ -36,7 +37,7 @@ def collect(root: Path, prefix: str) -> list[dict]:
         r = {"run": d.name, "group": re.sub(r"_s\d+$", "", d.name)}
         if m := _load(d / "model.json"):
             r["params_M"] = m["denoiser_params"] / 1e6
-        ev = sorted(d.glob("eval_test_k*_s*.json"))
+        ev = sorted(d.glob(f"eval_test_{tag}.json" if tag else "eval_test_k*_s*.json"))
         ev = [e for e in ev if not re.search(r"_(zeros|cat\w+)\.json$", e.name)]
         if ev:
             s = _load(ev[-1])["summary"]
@@ -45,7 +46,7 @@ def collect(root: Path, prefix: str) -> list[dict]:
             s = _load(sw)
             r |= {"swap_own": s["own"]["cd_to_own_gt"], "swap_zero": s["zeros"]["cd_to_own_gt"],
                   "follow_other": s["other_category"].get("follows_donor_frac")}
-        if idf := next(iter(sorted(d.glob("identify_pred_test_*.json"))), None):
+        if idf := next(iter(sorted(d.glob(f"identify_pred_test_{tag}.json" if tag else "identify_pred_test_*.json"))), None):
             s = _load(idf)
             r |= {"inst_top1": s["inst_top1"], "cat_top1": s["cat_top1"], "afc_within": s["afc_within_cat"]}
         rows.append(r)
@@ -77,9 +78,12 @@ def main(argv=None):
     ap.add_argument("--prefix", default="bench")
     ap.add_argument("--baselines", default=None, help="n3d.baselines run name, for reference rows")
     ap.add_argument("--out", type=Path, default=None, help="also write markdown here")
+    ap.add_argument("--tag", default=None, help="sampling run to read, e.g. k5_s100 or k5_s1000")
     a = ap.parse_args(argv)
     root = config.default_runs_root()
-    rows = collect(root, a.prefix)
+    rows = collect(root, a.prefix, a.tag)
+    if a.tag:
+        rows = [r for r in rows if "cd" in r]
     md = table(rows)
     if a.baselines and (b := _load(root / a.baselines / "baselines_summary.json")):
         md += "\n\nBaselines (test, mean CD):\n" + "\n".join(

@@ -156,6 +156,23 @@ def cmd(args: str, gpu: str = DEFAULT_GPU):
 
 
 @app.local_entrypoint()
-def aggregate(prefix: str = "bench", baselines: str = ""):
-    extra = ["--baselines", baselines] if baselines else []
+def aggregate(prefix: str = "bench", baselines: str = "", tag: str = ""):
+    extra = (["--baselines", baselines] if baselines else []) + (["--tag", tag] if tag else [])
     print(run_cpu.remote(["python", "-m", "n3d.aggregate", "--prefix", prefix, *extra]))
+
+
+@app.local_entrypoint()
+def audit(participants: str = "sub01 sub02 sub03 sub04 sub05", seeds: str = "0 1", epochs: int = 200,
+          prefix: str = "audit", gpu: str = DEFAULT_GPU, summarize: bool = False):
+    """Encoder replication audit (n3d.audit): one deployed GPU job per participant. --summarize prints the table."""
+    if summarize:
+        print(run_cpu.remote(["python", "-m", "n3d.audit", "--summarize", "--prefix", prefix]))
+        return
+    from n3d import audit as au
+    js = au.jobs(tuple(participants.split()), tuple(int(s) for s in seeds.split()), epochs, prefix)
+    fn = modal.Function.from_name("n3d", "run_job").with_options(gpu=gpu)
+    ids = {j.name: fn.spawn(j.name, j.cmds).object_id for j in js}
+    out = ROOT / "runs" / f"calls_{prefix}.json"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps(ids, indent=1))
+    print(f"spawned {len(ids)} calls; check: modal run scripts/modal_n3d.py::status --calls {out}")

@@ -75,8 +75,9 @@ def jobs(tier: str, seeds=(0, 1), steps: int = 30_000, n_points: int = 8192, sam
                         [*py, "n3d.diffusion", "sample", "--run", run, "--samples", str(samples), "--steps", str(sample_steps)],
                         [*py, "n3d.diffusion", "swap", "--run", run, "--steps", str(sample_steps)]]
             else:
+                # one-shot Chamfer on 8192 points needs a B x 8192 x 8192 cdist (12 GB at batch 48): cap at 2048
                 train = [*py, "n3d.regress", "train", "--run", run, *common, "--max-steps", str(steps // 2),
-                         "--n-points", str(n_points)]
+                         "--n-points", str(min(n_points, 2048))]
                 pred = "pred_test_k1_s0.npz"
                 cmds = [train, [*py, "n3d.regress", "sample", "--run", run]]
             cmds.append([*py, "n3d.identify", "--run", run, "--file", pred])
