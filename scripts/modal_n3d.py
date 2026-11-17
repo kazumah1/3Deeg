@@ -18,6 +18,7 @@ the GPU architectures listed in TORCH_CUDA_ARCH_LIST).
 """
 from __future__ import annotations
 
+import json
 import shlex
 import subprocess
 import sys
@@ -79,7 +80,10 @@ def run_cpu(cmd: list[str]) -> str:
 @app.local_entrypoint()
 def sweep(tier: str = "clip", seeds: str = "0 1", steps: int = 30_000, n_points: int = 8192, samples: int = 5,
           sample_steps: int = 100, participants: str = "sub01", encoder_run: str = "", models: str = "",
-          prefix: str = "bench", gpu: str = DEFAULT_GPU, pvcnn_gpu: str = "A100-80GB", dry_run: bool = False):
+          prefix: str = "bench", gpu: str = DEFAULT_GPU, pvcnn_gpu: str = "A100-80GB", dry_run: bool = False,
+          deployed: bool = False):
+    """--deployed spawns on the deployed app (`modal deploy scripts/modal_n3d.py` first) and returns at once;
+    those calls outlive this client, unlike `modal run --detach`, which keeps only the last spawned call alive."""
     from n3d import sweep as sw
     js = sw.jobs(tier, tuple(int(s) for s in seeds.split()), steps, n_points, samples, sample_steps,
                  participants=tuple(participants.split()), encoder_run=encoder_run or None,
@@ -89,8 +93,31 @@ def sweep(tier: str = "clip", seeds: str = "0 1", steps: int = 30_000, n_points:
     if dry_run:
         return
     # PVCNN at batch 48 peaks at 26-29 GB (film) and 33-40 GB (concat, 1027-channel voxel grids): too big for 24 GB
-    calls = [run_job.with_options(gpu=pvcnn_gpu if j.needs_cuda else gpu).spawn(j.name, j.cmds) for j in js]
-    report([c for c in calls])
+    fn = modal.Function.from_name("n3d", "run_job") if deployed else run_job
+    calls = [fn.with_options(gpu=pvcnn_gpu if j.needs_cuda else gpu).spawn(j.name, j.cmds) for j in js]
+    if deployed:
+        ids = {j.name: c.object_id for j, c in zip(js, calls)}
+        out = ROOT / "runs" / f"calls_{prefix}_{tier}.json"
+        out.parent.mkdir(exist_ok=True)
+        out.write_text(json.dumps(ids, indent=1))
+        print(f"spawned {len(ids)} calls on deployed app; ids in {out}\n"
+              f"check: modal run scripts/modal_n3d.py::status --calls {out}")
+        return
+    report(calls)
+
+
+@app.local_entrypoint()
+def status(calls: str):
+    """Poll calls spawned with sweep --deployed (no waiting): running / ok / FAIL with log tail."""
+    ids = json.loads(Path(calls).read_text())
+    for name, cid in ids.items():
+        try:
+            res = modal.FunctionCall.from_id(cid).get(timeout=0)
+        except TimeoutError:
+            print(f"run  {name}"); continue
+        except Exception as e:  # noqa: BLE001
+            print(f"EXC  {name}  {repr(e)[:300]}"); continue
+        print(f"ok   {name}  {res['sec'] / 60:.1f} min" if res["ok"] else f"FAIL {name}\n  " + "\n  ".join(res["tail"]))
 
 
 def report(calls):

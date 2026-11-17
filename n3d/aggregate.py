@@ -83,7 +83,7 @@ def main(argv=None):
     md = table(rows)
     if a.baselines and (b := _load(root / a.baselines / "baselines_summary.json")):
         md += "\n\nBaselines (test, mean CD):\n" + "\n".join(
-            f"- {k}: {v if not isinstance(v, dict) else v.get('cd', v)}" for k, v in b.items())
+            f"- {k}: {v['mean']:.4f}" for k, v in sorted(((k, v) for k, v in b.items() if isinstance(v, dict)), key=lambda kv: kv[1]['mean']))
     print(md)
     if a.out:
         a.out.write_text(md + "\n")
