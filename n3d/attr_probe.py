@@ -55,7 +55,9 @@ def targets(b) -> dict:
     from .encoder import shape_descriptor
     rng = np.random.default_rng(0)
     d2 = np.stack([shape_descriptor(p, rng) for p in pts])  # rotation-invariant 3D geometry, no appearance
-    return {"d2": (d2 - d2.mean(0)) / (d2.std(0) + 1e-9), "cat": np.eye(72)[b.obj_cat], "color": np.eye(6)[b.color], "geom": geom, "clip": b.clip_video,
+    sil = silhouettes(pts[:, rng.choice(pts.shape[1], 2048, replace=False)])  # 2D appearance, 8 rotations
+    sil = (sil - sil.mean(0)) @ np.linalg.svd(sil - sil.mean(0), full_matrices=False)[2][:64].T  # top 64 PCs
+    return {"sil": sil / sil.std(0), "d2": (d2 - d2.mean(0)) / (d2.std(0) + 1e-9), "cat": np.eye(72)[b.obj_cat], "color": np.eye(6)[b.color], "geom": geom, "clip": b.clip_video,
             "_cat": b.obj_cat, "_color": b.color}
 
 
@@ -78,6 +80,11 @@ def _avg(F, trial_obj, objs, mask=None):
 def datasets(F, b, splits, mode: str):
     """Yield (label, Xtr, otr, Xva, Xte) with object ids otr for train rows."""
     F = _zscore_per_sub(F, b, splits["train"])
+    if mode == "stack":  # per-object concatenation of each participant's average: pools data, keeps topographies
+        subs = np.unique(b.trial_sub)
+        cat_ = lambda objs: np.concatenate([_avg(F, b.trial_obj, objs, b.trial_sub == s_) for s_ in subs], 1)
+        yield "stack", cat_(splits["train"]), splits["train"], cat_(splits["val"]), cat_(splits["test"])
+        return
     if mode == "grand":
         yield "grand", _avg(F, b.trial_obj, splits["train"]), splits["train"], \
             _avg(F, b.trial_obj, splits["val"]), _avg(F, b.trial_obj, splits["test"])
@@ -138,7 +145,7 @@ def metric(name, P, obj, T):
     return pair_2afc(P, T[name][obj], T["_cat"][obj], T["_color"][obj])
 
 
-PRIMARY = {"cat": "top5", "color": "bal_acc", "geom": "r_mean", "clip": "2afc", "d2": "2afc"}
+PRIMARY = {"cat": "top5", "color": "bal_acc", "geom": "r_mean", "clip": "2afc", "d2": "2afc", "sil": "2afc"}
 
 
 def probe(Xtr, otr, Xva, Xte, splits, T, names, n_perm, rng) -> dict:
@@ -163,15 +170,37 @@ def probe(Xtr, otr, Xva, Xte, splits, T, names, n_perm, rng) -> dict:
             nk = np.array([n[k] for n in null])
             extra |= {f"null_mean_{k}": float(nk.mean()), f"null_p95_{k}": float(np.percentile(nk, 95)),
                       f"p_{k}": float(((nk >= res[k]).sum() + 1) / (len(nk) + 1))}
-        out[nm] = res | extra | {"alpha": a, "val": va[a], "null_mean": extra[f"null_mean_{key}"],
+        out[nm] = res | extra | {f"_null_{k}": [n[k] for n in null] for k in res} | {"_null": [n[key] for n in null], "alpha": a, "val": va[a], "null_mean": extra[f"null_mean_{key}"],
                                  "null_p95": extra[f"null_p95_{key}"], "p_perm": extra[f"p_{key}"]}
     return out
+
+
+def _requantify(m: dict) -> dict:
+    """After averaging over participants: null statistics of the averaged metric. Draw k must use the SAME
+    training-label permutation for every participant (they share the real labels, so their real statistics are
+    correlated); independent per-participant draws would make the null of the mean too narrow."""
+    for nm, r in m.items():
+        primary = PRIMARY.get(nm)
+        for k in [x[len("_null_"):] for x in r if x.startswith("_null_")]:
+            nk, v = np.array(r[f"_null_{k}"]), r.get(k)
+            if nk.size == 0 or v is None:
+                continue
+            r[f"null_mean_{k}"], r[f"null_p95_{k}"] = float(nk.mean()), float(np.percentile(nk, 95))
+            r[f"p_{k}"] = float((np.sum(nk >= v) + 1) / (len(nk) + 1))
+            if k == primary:
+                r["null_mean"], r["null_p95"], r["p_perm"] = r[f"null_mean_{k}"], r[f"null_p95_{k}"], r[f"p_{k}"]
+    return m
+
+
+def _strip(m: dict) -> dict:
+    return {nm: {k: v for k, v in r.items() if not k.startswith("_null")} for nm, r in m.items()}
 
 
 def _mean_over(rows: list[dict]) -> dict:
     out = {}
     for nm in rows[0]:
-        out[nm] = {k: float(np.mean([r[nm][k] for r in rows])) for k in rows[0][nm]}
+        out[nm] = {k: (np.mean([r[nm][k] for r in rows], 0).tolist() if isinstance(rows[0][nm][k], list)
+                       else float(np.mean([r[nm][k] for r in rows]))) for k in rows[0][nm]}
     return out
 
 
@@ -185,9 +214,9 @@ def attrs(a):
     b, splits, T = load(a.participants)
     F, rng, res = full_features(b), np.random.default_rng(0), {}
     for mode in ("subject", "grand"):
-        rows = {lab: probe(Xtr, otr, Xva, Xte, splits, T, ("cat", "color", "geom", "clip"), a.n_perm, rng)
+        rows = {lab: probe(Xtr, otr, Xva, Xte, splits, T, ("cat", "color", "geom", "clip"), a.n_perm, np.random.default_rng(0))  # same draws for every participant
                 for lab, Xtr, otr, Xva, Xte in datasets(F, b, splits, mode)}
-        res[mode] = {"per": rows, "mean": _mean_over(list(rows.values()))}
+        res[mode] = {"per": {k: _strip(v) for k, v in rows.items()}, "mean": _strip(_requantify(_mean_over(list(rows.values()))))}
     lines = ["| mode | target | metric | test | null mean | null 95% | p (perm) |", "|---|---|---|---|---|---|---|"]
     for mode in res:
         for nm, r in res[mode]["mean"].items():
@@ -207,9 +236,30 @@ def attrs(a):
     print(md)
 
 
+def evoked_onset_ms(x: np.ndarray, hz: int, search_ms: float = 1000.0) -> float:
+    """First time the grand-average global field power (channel std of the trial-mean) crosses 20% of the way
+    between its minimum and its first-second maximum: where the visual evoked response starts."""
+    g = x.mean(0).std(0)
+    n = min(len(g), int(search_ms * hz / 1000))
+    lo, hi = g[:n].min(), g[:n].max()
+    return float(1000 * np.argmax(g[:n] > lo + 0.2 * (hi - lo)) / hz)
+
+
+def _fwer(series, key):
+    """Max-statistic family-wise p per window: the null draw k is the same permutation in every window,
+    so compare each observed value with the distribution of max over windows."""
+    nulls = np.array([r[key.split("_")[0] + "__null"] for r in series])  # windows x draws
+    if nulls.size == 0:
+        return
+    mx = nulls.max(0)
+    for r in series:
+        r[f"{key}_p_fwer"] = float((np.sum(mx >= r[key]) + 1) / (len(mx) + 1))
+
+
 def timecourse(a):
     b, splits, T = load(a.participants)
-    rng, res = np.random.default_rng(0), {}
+    res = {"onset_ms": {"stat": evoked_onset_ms(b.stat, 250), "dyn": evoked_onset_ms(b.dyn, 100)}}
+    print("evoked onset (GFP 20% of rise):", res["onset_ms"], flush=True)
     wins = {"dyn": [(s, 50) for s in range(0, config.DYN_LEN - 50 + 1, 25)],      # 500 ms @100 Hz
             "stat": [(s, 50) for s in range(0, config.STAT_LEN - 50 + 1, 25)]}    # 200 ms @250 Hz
     hz = {"dyn": 100, "stat": 250}
@@ -218,13 +268,20 @@ def timecourse(a):
             series = []
             for s, w in ws:
                 F = window_features(b, stream, s, w)
-                rows = [probe(Xtr, otr, Xva, Xte, splits, T, ("clip", "color"), a.n_perm, rng)
+                rows = [probe(Xtr, otr, Xva, Xte, splits, T, ("clip", "color"), a.n_perm, np.random.default_rng(0))  # same draws for every participant and window
                         for _, Xtr, otr, Xva, Xte in datasets(F, b, splits, mode)]
-                m = _mean_over(rows)
+                m = _requantify(_mean_over(rows))  # null of the participant-averaged statistic
+                for nm in m:
+                    m[nm] = {k: v for k, v in m[nm].items() if not k.startswith("_null_")}
                 series.append({"t_ms": 1000 * (s + w / 2) / hz[stream], **{f"{nm}_{k}": v for nm, r in m.items()
                                                                          for k, v in r.items()}})
                 print(stream, mode, f"{series[-1]['t_ms']:.0f}ms clip2afc {m['clip']['2afc']:.3f} "
                       f"(null95 {m['clip']['null_p95']:.3f})  color {m['color']['bal_acc']:.3f}", flush=True)
+            _fwer(series, "clip_2afc"); _fwer(series, "color_bal_acc")
+            for r in series:
+                r.pop("clip__null", None); r.pop("color__null", None)
+            sig = [f"{r['t_ms']:.0f}" for r in series if r.get("clip_2afc_p_fwer", 1) < 0.05]
+            print(f"{stream} {mode} clip windows FWER p<.05: {', '.join(sig) or 'none'}", flush=True)
             res[f"{stream}_{mode}"] = series
             best = max(series, key=lambda r: r["clip_val"])  # window chosen on val, reported on test
             print(f"{stream} {mode} val-picked window {best['t_ms']:.0f}ms: test clip2afc {best['clip_2afc']:.3f} "
@@ -240,9 +297,9 @@ def window(a):
     b, splits, T = load(a.participants)
     F, rng, res = window_features(b, a.stream, a.start, a.width), np.random.default_rng(1), {}
     for mode in ("subject", "grand"):
-        rows = [probe(Xtr, otr, Xva, Xte, splits, T, ("clip", "d2", "geom", "cat"), a.n_perm, rng)
+        rows = [probe(Xtr, otr, Xva, Xte, splits, T, ("clip", "d2", "geom", "cat"), a.n_perm, np.random.default_rng(100))  # same draws for every participant
                 for _, Xtr, otr, Xva, Xte in datasets(F, b, splits, mode)]
-        res[mode] = m = _mean_over(rows)
+        res[mode] = m = _strip(_requantify(_mean_over(rows)))
         c = m["clip"]
         print(f"{mode}: clip 2afc {c['2afc']:.3f} (p {c['p_2afc']:.4f}) | within {c['2afc_within']:.3f} "
               f"(null mean {c['null_mean_2afc_within']:.3f}, 95% {c['null_p95_2afc_within']:.3f}, p {c['p_2afc_within']:.4f}) "
@@ -394,7 +451,11 @@ def scaling(a):
     subs = np.unique(b.trial_sub)
     rows = []
     for n in range(1, len(subs) + 1):
-        for combo in combinations(subs.tolist(), n):
+        combos = list(combinations(subs.tolist(), n))
+        if len(combos) > a.max_subsets:  # sample subsets deterministically when there are too many
+            pick = np.random.default_rng(n).choice(len(combos), a.max_subsets, replace=False)
+            combos = [combos[i] for i in sorted(pick)]
+        for combo in combos:
             for r in (1, 2, 4):
                 keep = np.isin(b.trial_sub, combo) & (~is_test | (rep < r))
                 bv = SimpleNamespace(trial_sub=b.trial_sub[keep], trial_obj=b.trial_obj[keep])
@@ -427,7 +488,7 @@ def scaling(a):
                  + ", ".join(f"{t}: {('%.0f' % v) if v else 'unreachable'}" for t, v in need.items()))
     print("\n".join(lines))
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
-    (out / f"probe_scaling_{a.stream}.json").write_text(json.dumps(
+    (out / f"probe_scaling_{a.stream}{a.tag}.json").write_text(json.dumps(
         {"rows": rows, "fit": {"dmax": dmax, "c": c, "ceiling": ceil, "need": need}}, indent=1))
     if a.fig:
         import matplotlib
@@ -538,7 +599,8 @@ def rsa(a):
                 yp = _rank(D[np.ix_(pm, pm)][iu])
                 nr.append(np.corrcoef(yp, rk[k])[0, 1]); npr.append(_partial(yp, rk[k], others))
             out[k] = {"rho": r, "p": float((np.sum(np.array(nr) >= r) + 1) / (len(nr) + 1)),
-                      "partial": pr, "p_partial": float((np.sum(np.array(npr) >= pr) + 1) / (len(npr) + 1))}
+                      "partial": pr, "p_partial": float((np.sum(np.array(npr) >= pr) + 1) / (len(npr) + 1)),
+                      "_nr": nr, "_npr": npr}
         return out
 
     res = {"model_intercorr": {f"{x}~{y}": float(np.corrcoef(rk[x], rk[y])[0, 1])
@@ -553,6 +615,18 @@ def rsa(a):
         res["windows"].append({"window": t, "reliability": rel, **sc})
         print(f"{t:6s} rel {rel:.3f} | " + " | ".join(
             f"{k} {v['rho']:.3f} (p {v['p']:.3f}) partial {v['partial']:.3f} (p {v['p_partial']:.3f})" for k, v in sc.items()), flush=True)
+    ws = [r for r in res["windows"] if r["window"] != "full"]
+    for k in names:  # max-statistic over the stat windows, per model (same object permutations in every window)
+        for stat, nk, pk in (("rho", "_nr", "p_fwer"), ("partial", "_npr", "p_partial_fwer")):
+            mx = np.max([r[k][nk] for r in ws], 0)
+            for r in ws:
+                r[k][pk] = float((np.sum(mx >= r[k][stat]) + 1) / (len(mx) + 1))
+        sig = [r["window"] for r in ws if r[k]["p_partial_fwer"] < 0.05]
+        print(f"{k}: partial FWER p<.05 at {', '.join(sig) or 'none'}; min p_partial_fwer "
+              f"{min(r[k]['p_partial_fwer'] for r in ws):.3f}")
+    for r in res["windows"]:
+        for k in names:
+            r[k].pop("_nr", None); r[k].pop("_npr", None)
     print("model inter-correlations:", {k: round(v, 2) for k, v in res["model_intercorr"].items()})
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     (out / "probe_rsa.json").write_text(json.dumps(res, indent=1))
@@ -569,12 +643,111 @@ def rsa(a):
                 sig = [(tt, r[k][key]) for tt, r in zip(t, ws) if r[k]["p" if key == "rho" else "p_partial"] < 0.05]
                 if sig:
                     ax.scatter(*zip(*sig), s=40, facecolors="none", edgecolors="k", lw=0.8)
-            ax.axhline(0, c="gray", lw=0.5); ax.set_xlabel("static-image window centre (ms)"); ax.set_title(title, fontsize=9)
+                fw = [(tt, r[k][key]) for tt, r in zip(t, ws) if r[k]["p_fwer" if key == "rho" else "p_partial_fwer"] < 0.05]
+                if fw:
+                    ax.scatter(*zip(*fw), s=90, marker="*", c="k", zorder=5)
+            ax.axhline(0, c="gray", lw=0.5); ax.set_xlabel("static-image window centre, epoch time (ms)"); ax.set_title(title, fontsize=9)
         axes[0].legend(fontsize=7); axes[0].set_ylabel("rho (144 test objects)")
-        fig.suptitle("RSA: which description of the object does the EEG similarity follow? circles: Mantel p < .05 (uncorrected)", fontsize=9)
+        fig.suptitle("RSA: which description of the object does the EEG similarity follow? circles: Mantel p < .05 uncorrected; stars: max-stat FWER p < .05 across windows", fontsize=9)
         Path(a.fig).parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(a.fig, dpi=200, bbox_inches="tight")
         print("wrote", a.fig)
+
+
+def within(a):
+    """Is there within-category information, and where? For each window x pooling mode, ridge to CLIP and to the
+    D2 shape descriptor; within-category pairwise 2AFC (72 sibling pairs) with the group-level permutation null,
+    plus a max-statistic FWER p across windows (same permutations in every window)."""
+    b, splits, T = load(a.participants)
+    wins = [("full", None)] + [("stat", (s_, 50)) for s_ in range(0, config.STAT_LEN - 50 + 1, 25)] \
+        + [("dyn", (s_, 50)) for s_ in (0, 25, 50, 75)]
+    if a.windows == "core":
+        wins = [("full", None)] + [("stat", (s_, 50)) for s_ in (50, 75, 100, 125, 150)]
+    keys = [(t, k) for t in a.targets for k in ("2afc_within", "2afc_within_samecol", "2afc_between")]
+    res = {}
+    for mode in a.modes:
+        rows = []
+        for stream, w in wins:
+            F = full_features(b) if stream == "full" else window_features(b, stream, *w)
+            per = [probe(Xtr, otr, Xva, Xte, splits, T, tuple(a.targets), a.n_perm, np.random.default_rng(7))
+                   for _, Xtr, otr, Xva, Xte in datasets(F, b, splits, mode)]
+            m = _requantify(_mean_over(per))
+            hz = 250 if stream == "stat" else 100
+            t = "full" if w is None else f"{stream}{1000 * (w[0] + w[1] / 2) / hz:.0f}ms"
+            rows.append({"window": t, **{f"{nm}:{k}": m[nm][k] for nm, k in keys},
+                         **{f"{nm}:{k}:p": m[nm][f"p_{k}"] for nm, k in keys},
+                         **{f"{nm}:{k}:null": m[nm][f"_null_{k}"] for nm, k in keys}})
+        for nm, k in keys:  # FWER across windows
+            mx = np.max([r[f"{nm}:{k}:null"] for r in rows], 0)
+            for r in rows:
+                r[f"{nm}:{k}:pfwer"] = float((np.sum(mx >= r[f"{nm}:{k}"]) + 1) / (len(mx) + 1))
+        for r in rows:
+            for nm, k in keys:
+                r.pop(f"{nm}:{k}:null")
+        res[mode] = rows
+        print(f"== {mode}")
+        for r in rows:
+            print(f"{r['window']:9s} " + " | ".join(
+                f"{nm}/{k.replace('2afc_', '')} {r[f'{nm}:{k}']:.3f} (p {r[f'{nm}:{k}:p']:.3f}, fwer {r[f'{nm}:{k}:pfwer']:.3f})"
+                for nm, k in keys), flush=True)
+    out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    (out / f"probe_within{a.tag}.json").write_text(json.dumps(res, indent=1))
+
+
+def select(a):
+    """Same-category shape selection (the poster's benchmark) with the linear readout: the true category is given;
+    EEG-predicted CLIP picks one of that category's training shapes (highest correlation). Mean Chamfer of the pick
+    vs: sibling swap (the other held-out object's EEG in the same category), category medoid, random candidate,
+    oracle. Permutation p for correct < swap: swap the two siblings' predictions in random subsets of categories."""
+    from .metrics import chamfer_np
+    b, splits, T = load(a.participants)
+    F = full_features(b) if a.stream == "full" else window_features(b, a.stream, a.start, a.width)
+    Y, cat = T[a.target], T["_cat"]
+    tr, te = splits["train"], splits["test"]
+    rng = np.random.default_rng(0)
+    sub = {int(o): b.points[o][rng.choice(b.points.shape[1], a.points, replace=False)] for o in np.concatenate([tr, te])}
+    cands = {c: tr[cat[tr] == c] for c in np.unique(cat[te])}
+    cd = {}
+    for c, cs in cands.items():
+        for o in [*te[cat[te] == c], *cs]:
+            for k in cs:
+                if (int(o), int(k)) not in cd:
+                    cd[(int(o), int(k))] = chamfer_np(sub[int(o)], sub[int(k)])["cd"]
+    medoid = {c: cs[np.argmin([np.mean([cd[(int(j), int(k))] for j in cs if j != k]) for k in cs])] for c, cs in cands.items()}
+    sib = {int(o): int(next(x for x in te[cat[te] == cat[o]] if x != o)) for o in te}
+    res = {}
+    for mode in a.modes:
+        rows = []
+        for lab, Xtr, otr, Xva, Xte in datasets(F, b, splits, mode):
+            model = Ridge(Xtr)
+            va = {al: pair_2afc(model.predict(Y[otr], [Xva], al)[0], Y[splits["val"]])["2afc"] for al in ALPHAS}
+            P = dict(zip(te.tolist(), model.predict(Y[otr], [Xte], max(va, key=va.get))[0]))
+
+            def pick(p, c):
+                cs = cands[c]
+                z = lambda v: (v - v.mean()) / (v.std() + 1e-9)
+                return int(cs[np.argmax([np.mean(z(p) * z(Y[k])) for k in cs])])
+            corr = np.array([cd[(int(o), pick(P[int(o)], cat[o]))] for o in te])
+            swap = np.array([cd[(int(o), pick(P[sib[int(o)]], cat[o]))] for o in te])
+            rows.append({"correct": corr, "swap": swap})
+        corr, swap = np.mean([r["correct"] for r in rows], 0), np.mean([r["swap"] for r in rows], 0)
+        # paired sign-flip test over categories: under H0 correct and swap are exchangeable within each sibling pair
+        cats = cat[te]
+        d_cat = np.array([(swap - corr)[cats == c].sum() for c in np.unique(cats)])
+        obs = d_cat.sum()
+        flips = rng.choice([-1, 1], size=(a.n_perm, len(d_cat)))
+        p = float((np.sum((flips * d_cat).sum(1) >= obs) + 1) / (a.n_perm + 1))
+        med = np.array([cd[(int(o), int(medoid[cat[o]]))] for o in te])
+        rnd = np.array([np.mean([cd[(int(o), int(k))] for k in cands[cat[o]]]) for o in te])
+        orc = np.array([min(cd[(int(o), int(k))] for k in cands[cat[o]]) for o in te])
+        res[mode] = {"correct": float(corr.mean()), "swap": float(swap.mean()), "p_correct_lt_swap": p,
+                     "medoid": float(med.mean()), "random_candidate": float(rnd.mean()), "oracle": float(orc.mean()),
+                     "frac_correct_beats_medoid": float((corr < med).mean())}
+        r = res[mode]
+        print(f"{mode:8s} correct {r['correct']:.4f} | swap {r['swap']:.4f} (p {p:.3f}) | medoid {r['medoid']:.4f} | "
+              f"random cand {r['random_candidate']:.4f} | oracle {r['oracle']:.4f}", flush=True)
+    out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    (out / f"probe_select_{a.stream}_{a.target}.json").write_text(json.dumps(res, indent=1))
 
 
 def plot(res, path: Path):
@@ -594,10 +767,16 @@ def plot(res, path: Path):
                 pre = key.split("_")[0]
                 ax.fill_between(t, [r[f"{pre}_null_mean"] for r in s], [r[f"{pre}_null_p95"] for r in s], color=c, alpha=0.15)
             ax.axhline(ch, c="k", lw=0.5, ls="--")
+            if "onset_ms" in res and stream == "stat":  # dyn GFP is high from the first sample: no clean onset
+                ax.axvline(res["onset_ms"][stream], c="gray", lw=0.8, ls=":")
+            for mode, c in (("subject", "tab:blue"), ("grand", "tab:orange")):
+                sig = [(r["t_ms"], r[key]) for r in res.get(f"{stream}_{mode}", []) if r.get(f"{key}_p_fwer", 1) < 0.05]
+                if sig:
+                    ax.scatter(*zip(*sig), s=30, facecolors="none", edgecolors=c, lw=1)
             ax.set_title(f"{'rotating video (6 s)' if stream == 'dyn' else 'static image (1 s)'}: {lab}", fontsize=9)
-            ax.set_xlabel("window centre (ms)")
+            ax.set_xlabel("window centre, epoch time (ms)")
     axes[0, 0].legend(fontsize=8)
-    fig.suptitle("Sliding-window linear decoding; shaded = permutation null mean..95th pct", fontsize=9)
+    fig.suptitle("Sliding-window linear decoding; shaded = permutation null mean..95th pct; circles = max-stat FWER p < .05\ndotted = static-image evoked-response onset (GFP)", fontsize=9)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=200, bbox_inches="tight")
     print("wrote", path)
@@ -606,13 +785,26 @@ def plot(res, path: Path):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("attrs", "time", "window", "export", "levels", "crossfit", "scaling", "rsa"):
+    for name in ("attrs", "time", "window", "export", "levels", "crossfit", "scaling", "rsa", "within", "select"):
         p = sub.add_parser(name)
         p.add_argument("--participants", nargs="+", default=["sub01", "sub02", "sub03", "sub04", "sub05"])
-        p.add_argument("--n-perm", type=int, default={"attrs": 50, "rsa": 200}.get(name, 20))
+        p.add_argument("--n-perm", type=int, default={"attrs": 50, "rsa": 200, "select": 10000}.get(name, 20))
         p.add_argument("--out", default=str(config.default_runs_root() / "probe"))
         if name == "time":
             p.add_argument("--fig", default="figs/probe_time.png")
+        if name == "select":
+            p.add_argument("--stream", default="stat", choices=["stat", "dyn", "full"])
+            p.add_argument("--start", type=int, default=75)
+            p.add_argument("--width", type=int, default=50)
+            p.add_argument("--points", type=int, default=2048)
+            p.add_argument("--target", default="clip", choices=["clip", "d2", "sil"],
+                           help="space the EEG is mapped to and candidates are ranked in")
+            p.add_argument("--modes", nargs="+", default=["subject", "grand", "stack"])
+        if name == "within":
+            p.add_argument("--modes", nargs="+", default=["subject", "grand", "stack"])
+            p.add_argument("--targets", nargs="+", default=["clip", "d2"])
+            p.add_argument("--windows", default="all", choices=["all", "core"], help="core: full + static 300-700 ms")
+            p.add_argument("--tag", default="")
         if name == "rsa":
             p.add_argument("--fig", default="figs/probe_rsa.png")
         if name == "scaling":
@@ -620,6 +812,8 @@ def main(argv=None):
             p.add_argument("--start", type=int, default=75)
             p.add_argument("--width", type=int, default=50)
             p.add_argument("--fig", default="figs/probe_scaling.png")
+            p.add_argument("--max-subsets", type=int, default=20)
+            p.add_argument("--tag", default="")
         if name == "crossfit":
             p.add_argument("--stream", default="stat", choices=["stat", "dyn", "full"])
             p.add_argument("--start", type=int, default=75)
@@ -633,14 +827,14 @@ def main(argv=None):
             p.add_argument("--stream", default="stat", choices=["stat", "dyn", "full"])
             p.add_argument("--start", type=int, default=75)
             p.add_argument("--width", type=int, default=50)
-            p.add_argument("--mode", default="grand", choices=["grand", "subject"])
+            p.add_argument("--mode", default="grand", choices=["grand", "subject", "stack"])
             p.add_argument("--perm-seed", type=int, default=None)
         if name == "window":
             p.add_argument("--stream", default="stat", choices=["stat", "dyn"])
             p.add_argument("--start", type=int, default=75, help="samples; stat 75 @250 Hz = 300 ms")
             p.add_argument("--width", type=int, default=50)
     a = ap.parse_args(argv)
-    {"attrs": attrs, "time": timecourse, "window": window, "export": export, "levels": levels, "crossfit": crossfit, "scaling": scaling, "rsa": rsa}[a.cmd](a)
+    {"attrs": attrs, "time": timecourse, "window": window, "export": export, "levels": levels, "crossfit": crossfit, "scaling": scaling, "rsa": rsa, "within": within, "select": select}[a.cmd](a)
 
 
 if __name__ == "__main__":
