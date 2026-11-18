@@ -42,7 +42,7 @@ image = (
     .env({"N3D_DATA": "/data/neuro-3d", "N3D_RUNS": "/runs", "N3D_UPSTREAM": "/cache/upstream",
           "TORCH_EXTENSIONS_DIR": "/cache/torch_extensions",
           "TORCH_CUDA_ARCH_LIST": "7.5;8.0;8.6;8.9;9.0", "PYTHONUNBUFFERED": "1"})
-    .add_local_python_source("n3d")
+    .add_local_python_source("n3d", copy=True)  # baked in: a code change means a new image, so no stale warm containers
 )
 VOLS = {"/data": data, "/runs": runs, "/cache": cache}
 DEFAULT_GPU = "L4"
@@ -250,4 +250,25 @@ def clipfile(files: str, decoders: str = "bench_clip_pn_concat_s0 bench_clip_pn_
     out = ROOT / "runs" / f"calls_{name}.json"
     out.parent.mkdir(exist_ok=True)
     out.write_text(json.dumps(ids, indent=1))
+    print(f"spawned {len(ids)} calls; check: modal run scripts/modal_n3d.py::status --calls {out}")
+
+
+@app.local_entrypoint()
+def noiseaware(tables: str = "table_stat_grand table_stat_grand_null", models: str = "pn_film pn_concat",
+               seeds: str = "0", steps: int = 30_000, gpu: str = "A10G", src: str = "clippred"):
+    """Noise-aware decoders: CLIP-tier training/sampling/identify, but every CLIP row replaced by the
+    ridge-decoded table (attr_probe crossfit, uploaded to /runs/<src>/). Run names na_<table>_clip_<model>_s<seed>."""
+    from n3d import sweep as sw
+    fn = modal.Function.from_name("n3d", "run_job").with_options(gpu=gpu)
+    ids = {}
+    for t in tables.split():
+        js = sw.jobs("clip", tuple(int(s) for s in seeds.split()), steps, models=tuple(models.split()),
+                     prefix=f"na_{t.removeprefix('table_')}")
+        for j in js:
+            j.cmds[0] += ["--clip-table", f"/runs/{src}/{t}.npz"]
+            ids[j.name] = fn.spawn(j.name, j.cmds).object_id
+            print(j.name)
+    out = ROOT / "runs" / "calls_noiseaware.json"
+    prev = json.loads(out.read_text()) if out.exists() else {}
+    out.write_text(json.dumps(prev | ids, indent=1))  # merge: relaunching a subset keeps the other ids
     print(f"spawned {len(ids)} calls; check: modal run scripts/modal_n3d.py::status --calls {out}")

@@ -155,6 +155,9 @@ def probe(Xtr, otr, Xva, Xte, splits, T, names, n_perm, rng) -> dict:
             perm = dict(zip(tr_objs.tolist(), rng.permutation(tr_objs).tolist()))
             Yp = Yobj[[perm[int(o)] for o in otr]]
             null.append(metric(nm, model.predict(Yp, [Xte], a)[0], splits["test"], T))
+        if not null:
+            out[nm] = res | {"alpha": a, "val": va[a]}
+            continue
         extra = {}
         for k in res:
             nk = np.array([n[k] for n in null])
@@ -343,6 +346,237 @@ def levels(a):
         print("wrote", a.fig)
 
 
+def crossfit(a):
+    """Condition table for a noise-aware decoder: ridge-decoded CLIP for every object, where each training
+    variant (00-06) is predicted by a ridge fit on the other six (so the decoder trains on out-of-sample
+    predictions with test-like noise), val/test by the fit on all training objects. alpha picked on val.
+    Writes <out>/table_<stream>_grand.npz and a null twin whose training rows are shuffled across objects."""
+    b, splits, T = load(a.participants)
+    F = full_features(b) if a.stream == "full" else window_features(b, a.stream, a.start, a.width)
+    Y = T["clip"]
+    (_, Xtr, otr, Xva, Xte), = list(datasets(F, b, splits, "grand"))
+    model = Ridge(Xtr)
+    va = {al: pair_2afc(model.predict(Y[otr], [Xva], al)[0], Y[splits["val"]])["2afc"] for al in ALPHAS}
+    al = max(va, key=va.get)
+    table = Y.copy()
+    Pva, Pte = model.predict(Y[otr], [Xva, Xte], al)
+    table[splits["val"]], table[splits["test"]] = Pva, Pte
+    var = b.obj_variant[otr]
+    for v in np.unique(var):
+        m = var == v
+        table[otr[m]] = Ridge(Xtr[~m]).predict(Y[otr[~m]], [Xtr[m]], al)[0]
+    cf = pair_2afc(table[otr], Y[otr])["2afc"]
+    out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    allobj = np.arange(len(Y))
+    np.savez_compressed(out / f"table_{a.stream}_grand.npz", obj=allobj, clip=table.astype(np.float32))
+    null = table.copy()
+    null[otr] = table[otr][np.random.default_rng(0).permutation(len(otr))]
+    np.savez_compressed(out / f"table_{a.stream}_grand_null.npz", obj=allobj, clip=null.astype(np.float32))
+    print(f"alpha {al:g}: cross-fitted train 2afc {cf:.3f}, val {va[al]:.3f}, "
+          f"test {pair_2afc(Pte, Y[splits['test']])['2afc']:.3f}; wrote tables to {out}")
+
+
+def scaling(a):
+    """Is decoding SNR-limited? Grand-average every subset of n participants (n = 1..5) using r test repeats
+    (r = 1, 2, 4), refit the ridge (alpha on val), score test CLIP 2AFC and geometry r. Then fit
+    2AFC = Phi(d/sqrt2), d(N) = d_max * sqrt(N / (N + c)), N = n*r trials averaged per test object."""
+    from itertools import combinations
+    from types import SimpleNamespace
+    from scipy.optimize import curve_fit
+    from scipy.stats import norm
+    b, splits, T = load(a.participants)
+    F = full_features(b) if a.stream == "full" else window_features(b, a.stream, a.start, a.width)
+    rep = np.zeros(len(b.trial_obj), int)  # repeat index within (participant, object)
+    seen = {}
+    for t, key in enumerate(zip(b.trial_sub.tolist(), b.trial_obj.tolist())):
+        rep[t] = seen.get(key, 0); seen[key] = rep[t] + 1
+    is_test = np.isin(b.trial_obj, splits["test"])
+    subs = np.unique(b.trial_sub)
+    rows = []
+    for n in range(1, len(subs) + 1):
+        for combo in combinations(subs.tolist(), n):
+            for r in (1, 2, 4):
+                keep = np.isin(b.trial_sub, combo) & (~is_test | (rep < r))
+                bv = SimpleNamespace(trial_sub=b.trial_sub[keep], trial_obj=b.trial_obj[keep])
+                (_, Xtr, otr, Xva, Xte), = list(datasets(F[keep], bv, splits, "grand"))
+                res = probe(Xtr, otr, Xva, Xte, splits, T, ("clip", "geom"), 0, np.random.default_rng(0))
+                rows.append({"n": n, "r": r, "subs": list(combo), "clip_2afc": res["clip"]["2afc"],
+                             "clip_within": res["clip"]["2afc_within"], "geom_r": res["geom"]["r_mean"]})
+        print(f"n={n} done", flush=True)
+    agg = {}
+    for n in range(1, len(subs) + 1):
+        for r in (1, 2, 4):
+            g = [x for x in rows if x["n"] == n and x["r"] == r]
+            agg[(n, r)] = {k: (float(np.mean([x[k] for x in g])), float(np.std([x[k] for x in g])))
+                           for k in ("clip_2afc", "clip_within", "geom_r")}
+    Ns = np.array([n * r for (n, r) in agg], float)
+    pc = np.clip([agg[k]["clip_2afc"][0] for k in agg], 0.501, 0.999)
+    dp = np.sqrt(2) * norm.ppf(pc)
+    f = lambda N, dmax, c: dmax * np.sqrt(N / (N + c))
+    (dmax, c), _ = curve_fit(f, Ns, dp, p0=(2.0, 10.0), bounds=([0, 0], [20, 1e4]))
+    ceil = float(norm.cdf(dmax / np.sqrt(2)))
+    need = {}
+    for target in (0.85, 0.9, 0.95):
+        d = np.sqrt(2) * norm.ppf(target)
+        need[target] = float(c * d ** 2 / (dmax ** 2 - d ** 2)) if d < dmax else None
+    lines = ["| participants n | test repeats r | trials N | CLIP 2AFC | within-cat | geom r |", "|---|---|---|---|---|---|"]
+    for (n, r), v in agg.items():
+        lines.append(f"| {n} | {r} | {n * r} | {v['clip_2afc'][0]:.3f}±{v['clip_2afc'][1]:.3f} | "
+                     f"{v['clip_within'][0]:.3f} | {v['geom_r'][0]:.3f}±{v['geom_r'][1]:.3f} |")
+    lines.append(f"\nfit d(N) = {dmax:.2f} sqrt(N/(N+{c:.1f})): ceiling 2AFC {ceil:.3f}; trials per object needed: "
+                 + ", ".join(f"{t}: {('%.0f' % v) if v else 'unreachable'}" for t, v in need.items()))
+    print("\n".join(lines))
+    out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    (out / f"probe_scaling_{a.stream}.json").write_text(json.dumps(
+        {"rows": rows, "fit": {"dmax": dmax, "c": c, "ceiling": ceil, "need": need}}, indent=1))
+    if a.fig:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(5, 3.5))
+        for r, mk in ((1, "o"), (2, "s"), (4, "^")):
+            ks = [(n, rr) for (n, rr) in agg if rr == r]
+            ax.errorbar([n * r for n, _ in ks], [agg[k]["clip_2afc"][0] for k in ks],
+                        yerr=[agg[k]["clip_2afc"][1] for k in ks], fmt=mk, label=f"{r} repeat(s) x n participants", capsize=2)
+        NN = np.logspace(0, np.log10(200), 100)
+        ax.plot(NN, norm.cdf(f(NN, dmax, c) / np.sqrt(2)), "k--", lw=1, label=f"fit, ceiling {ceil:.2f}")
+        ax.axhline(0.5, c="gray", lw=0.5)
+        ax.set_xscale("log"); ax.set_xlabel("EEG trials averaged per test object (N = n x r)")
+        ax.set_ylabel("CLIP pairwise 2AFC (test)"); ax.legend(fontsize=7)
+        ax.set_title("Decoding grows with averaging: SNR-limited", fontsize=9)
+        Path(a.fig).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(a.fig, dpi=200, bbox_inches="tight")
+        print("wrote", a.fig)
+
+
+def silhouettes(pts: np.ndarray, views: int = 8, res: int = 32) -> np.ndarray:
+    """Rotation-averaged-video proxy for the stimulus image: occupancy of the point cloud projected onto the
+    image plane (x', y up) at `views` rotations about the vertical axis, blurred, concatenated."""
+    from scipy.ndimage import gaussian_filter
+    out = np.zeros((len(pts), views, res, res), np.float32)
+    for v, th in enumerate(np.linspace(0, 2 * np.pi, views, endpoint=False)):
+        x = pts[..., 0] * np.cos(th) + pts[..., 2] * np.sin(th)
+        y = pts[..., 1]
+        for i in range(len(pts)):
+            h, _, _ = np.histogram2d(y[i], x[i], bins=res, range=[[-1, 1], [-1, 1]])
+            out[i, v] = gaussian_filter((h > 0).astype(np.float32), 1.0)
+    return out.reshape(len(pts), -1)
+
+
+def _corr_rdm(X):
+    Z = (X - X.mean(1, keepdims=True)) / (X.std(1, keepdims=True) + 1e-9)
+    return 1 - Z @ Z.T / X.shape[1]
+
+
+def _split_half_rdm(A, B):
+    Az = (A - A.mean(1, keepdims=True)) / (A.std(1, keepdims=True) + 1e-9)
+    Bz = (B - B.mean(1, keepdims=True)) / (B.std(1, keepdims=True) + 1e-9)
+    C = Az @ Bz.T / A.shape[1]
+    return 1 - (C + C.T) / 2, float(np.mean(np.diag(C)) - np.mean(C[~np.eye(len(C), dtype=bool)]))
+
+
+def _rank(v):
+    from scipy.stats import rankdata
+    return rankdata(v)
+
+
+def _partial(y, x, others):
+    if not others:
+        return float(np.corrcoef(y, x)[0, 1])
+    Z = np.column_stack([np.ones(len(y)), *others])
+    ry = y - Z @ np.linalg.lstsq(Z, y, rcond=None)[0]
+    rx = x - Z @ np.linalg.lstsq(Z, x, rcond=None)[0]
+    return float(np.corrcoef(ry, rx)[0, 1])
+
+
+def rsa_models(b, objs):
+    from .encoder import shape_descriptor
+    pts = b.points[objs]
+    rng = np.random.default_rng(0)
+    d2 = np.stack([shape_descriptor(p, rng) for p in pts]); d2 = (d2 - d2.mean(0)) / (d2.std(0) + 1e-9)
+    sil = silhouettes(pts[:, rng.choice(pts.shape[1], 2048, replace=False)])
+    cat, col = b.obj_cat[objs], b.color[objs]
+    return {"category": (cat[:, None] != cat[None, :]).astype(float),
+            "colour": (col[:, None] != col[None, :]).astype(float),
+            "silhouette": _corr_rdm(sil),
+            "clip": _corr_rdm(b.clip_video[objs]),
+            "geometry_d2": np.sqrt(((d2[:, None] - d2[None]) ** 2).sum(-1))}
+
+
+def rsa_eeg(F, b, splits, objs):
+    """Cross-validated EEG RDM over objs: repeats {0,1} vs {2,3}, each averaged over all participants."""
+    F = _zscore_per_sub(F, b, splits["train"])
+    rep = np.zeros(len(b.trial_obj), int); seen = {}
+    for t, key in enumerate(zip(b.trial_sub.tolist(), b.trial_obj.tolist())):
+        rep[t] = seen.get(key, 0); seen[key] = rep[t] + 1
+    A = _avg(F, b.trial_obj, objs, rep < 2)
+    B = _avg(F, b.trial_obj, objs, rep >= 2)
+    return _split_half_rdm(A, B)
+
+
+def rsa(a):
+    """Which stimulus description does the EEG similarity structure follow? Spearman between the cross-validated
+    EEG RDM (144 test objects) and model RDMs, plus partial Spearman (each model controlling for all others),
+    with Mantel permutation p-values (object labels permuted). Also per stat-stream window."""
+    b, splits, T = load(a.participants)
+    objs = splits["test"]
+    M = rsa_models(b, objs)
+    iu = np.triu_indices(len(objs), 1)
+    names = list(M)
+    rk = {k: _rank(M[k][iu]) for k in names}
+    rng = np.random.default_rng(3)
+    perms = [rng.permutation(len(objs)) for _ in range(a.n_perm)]
+
+    def score(D):
+        y = _rank(D[iu])
+        out = {}
+        for k in names:
+            others = [rk[o] for o in names if o != k]
+            r, pr = float(np.corrcoef(y, rk[k])[0, 1]), _partial(y, rk[k], others)
+            nr, npr = [], []
+            for pm in perms:
+                yp = _rank(D[np.ix_(pm, pm)][iu])
+                nr.append(np.corrcoef(yp, rk[k])[0, 1]); npr.append(_partial(yp, rk[k], others))
+            out[k] = {"rho": r, "p": float((np.sum(np.array(nr) >= r) + 1) / (len(nr) + 1)),
+                      "partial": pr, "p_partial": float((np.sum(np.array(npr) >= pr) + 1) / (len(npr) + 1))}
+        return out
+
+    res = {"model_intercorr": {f"{x}~{y}": float(np.corrcoef(rk[x], rk[y])[0, 1])
+                               for i, x in enumerate(names) for y in names[i + 1:]}}
+    windows = [("full", None)] + [("stat", (s, 50)) for s in range(0, config.STAT_LEN - 50 + 1, 25)]
+    res["windows"] = []
+    for stream, w in windows:
+        F = full_features(b) if stream == "full" else window_features(b, stream, *w)
+        D, rel = rsa_eeg(F, b, splits, objs)
+        sc = score(D)
+        t = "full" if w is None else f"{1000 * (w[0] + w[1] / 2) / 250:.0f}ms"
+        res["windows"].append({"window": t, "reliability": rel, **sc})
+        print(f"{t:6s} rel {rel:.3f} | " + " | ".join(
+            f"{k} {v['rho']:.3f} (p {v['p']:.3f}) partial {v['partial']:.3f} (p {v['p_partial']:.3f})" for k, v in sc.items()), flush=True)
+    print("model inter-correlations:", {k: round(v, 2) for k, v in res["model_intercorr"].items()})
+    out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    (out / "probe_rsa.json").write_text(json.dumps(res, indent=1))
+    if a.fig:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        ws = [r for r in res["windows"] if r["window"] != "full"]
+        t = [float(r["window"][:-2]) for r in ws]
+        fig, axes = plt.subplots(1, 2, figsize=(10, 3.5), sharey=True)
+        for ax, key, title in ((axes[0], "rho", "Spearman with EEG RDM"), (axes[1], "partial", "partial (controls for all other models)")):
+            for k in names:
+                ax.plot(t, [r[k][key] for r in ws], "o-", label=k, ms=3)
+                sig = [(tt, r[k][key]) for tt, r in zip(t, ws) if r[k]["p" if key == "rho" else "p_partial"] < 0.05]
+                if sig:
+                    ax.scatter(*zip(*sig), s=40, facecolors="none", edgecolors="k", lw=0.8)
+            ax.axhline(0, c="gray", lw=0.5); ax.set_xlabel("static-image window centre (ms)"); ax.set_title(title, fontsize=9)
+        axes[0].legend(fontsize=7); axes[0].set_ylabel("rho (144 test objects)")
+        fig.suptitle("RSA: which description of the object does the EEG similarity follow? circles: Mantel p < .05 (uncorrected)", fontsize=9)
+        Path(a.fig).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(a.fig, dpi=200, bbox_inches="tight")
+        print("wrote", a.fig)
+
+
 def plot(res, path: Path):
     import matplotlib
     matplotlib.use("Agg")
@@ -372,13 +606,24 @@ def plot(res, path: Path):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("attrs", "time", "window", "export", "levels"):
+    for name in ("attrs", "time", "window", "export", "levels", "crossfit", "scaling", "rsa"):
         p = sub.add_parser(name)
         p.add_argument("--participants", nargs="+", default=["sub01", "sub02", "sub03", "sub04", "sub05"])
-        p.add_argument("--n-perm", type=int, default=50 if name == "attrs" else 20)
+        p.add_argument("--n-perm", type=int, default={"attrs": 50, "rsa": 200}.get(name, 20))
         p.add_argument("--out", default=str(config.default_runs_root() / "probe"))
         if name == "time":
             p.add_argument("--fig", default="figs/probe_time.png")
+        if name == "rsa":
+            p.add_argument("--fig", default="figs/probe_rsa.png")
+        if name == "scaling":
+            p.add_argument("--stream", default="stat", choices=["stat", "dyn", "full"])
+            p.add_argument("--start", type=int, default=75)
+            p.add_argument("--width", type=int, default=50)
+            p.add_argument("--fig", default="figs/probe_scaling.png")
+        if name == "crossfit":
+            p.add_argument("--stream", default="stat", choices=["stat", "dyn", "full"])
+            p.add_argument("--start", type=int, default=75)
+            p.add_argument("--width", type=int, default=50)
         if name == "levels":
             p.add_argument("--stream", default="stat", choices=["stat", "dyn", "full"])
             p.add_argument("--start", type=int, default=75)
@@ -395,7 +640,7 @@ def main(argv=None):
             p.add_argument("--start", type=int, default=75, help="samples; stat 75 @250 Hz = 300 ms")
             p.add_argument("--width", type=int, default=50)
     a = ap.parse_args(argv)
-    {"attrs": attrs, "time": timecourse, "window": window, "export": export, "levels": levels}[a.cmd](a)
+    {"attrs": attrs, "time": timecourse, "window": window, "export": export, "levels": levels, "crossfit": crossfit, "scaling": scaling, "rsa": rsa}[a.cmd](a)
 
 
 if __name__ == "__main__":

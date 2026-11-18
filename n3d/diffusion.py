@@ -132,6 +132,10 @@ def load_ckpt(path_or_ck, net, cond, dev, opt=None, sched=None):
 
 def setup(args):
     b = load_bundle(args.data_root, tuple(args.participants), args.geometry)
+    if getattr(args, "clip_table", None):  # noise-aware decoder: train/sample on decoded CLIP (attr_probe crossfit)
+        z = np.load(args.clip_table)
+        b.clip_video = b.clip_video.copy()
+        b.clip_video[z["obj"]] = z["clip"]
     cats = [0, 14, 26, 51] if args.tiny else None
     splits = make_splits(b, args.split, categories=cats)
     if args.tiny:  # overfit check: train and evaluate on the same few training objects
@@ -232,7 +236,8 @@ def load_for_inference(args):
     for k in ("denoiser", "cond_mode", "cond_source", "encoder_run", "width", "voxel_res", "geometry",
               "participants", "split", "tiny"):
         setattr(args, k, saved[k])
-    for k, default in (("pn_width", 256), ("pn_depth", 4), ("pn_match_params", None), ("n_points", config.N_POINTS)):
+    for k, default in (("pn_width", 256), ("pn_depth", 4), ("pn_match_params", None), ("n_points", config.N_POINTS),
+                       ("clip_table", None)):
         setattr(args, k, saved.get(k, default))
     eeg_enc = getattr(args, "eeg_encoder", None)
     if eeg_enc:  # read the encoder's participants so the EEG trials match the encoder
@@ -407,6 +412,8 @@ def main(argv=None):
     t.add_argument("--milestone-every", type=int, default=10000, help="steps between weights-only milestones")
     t.add_argument("--seed", type=int, default=1234)
     t.add_argument("--restart", action="store_true")
+    t.add_argument("--clip-table", type=Path, default=None,
+                   help="npz (obj, clip) replacing CLIP rows for those objects (cond-source clip), e.g. a crossfit table")
     for name in ("sample", "swap"):
         p = sub.add_parser(name)
         p.add_argument("--run", required=True)
