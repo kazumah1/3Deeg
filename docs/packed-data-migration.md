@@ -13,6 +13,10 @@ The repository contains 17 data files, 4,800,155,977 bytes: 12 subject EEG NPZs,
 - Validate all 12 subject arrays and shared arrays; load actual CPU dataset items through the existing training data loader and check object-disjoint 504/72/144 train/validation/test splits.
 - Run the same pinned downloader and CPU loader in a live Colab runtime using a read-only `HF_TOKEN` secret. A local notebook syntax check alone does not satisfy this requirement.
 
+## Completed local checks
+
+All 17 files were downloaded afresh from the pinned private repository and passed SHA-256 checks. All 12 subjects passed array validation and the actual CPU dataset loader, preserving 504/72/144 disjoint train/validation/test object splits. Both geometry choices passed. Anonymous access returned HTTP 401. Four integrity/selection tests and notebook schema/code compilation passed. No training or GPU work ran.
+
 Local evidence is saved separately at `/Users/kazuma/3deeg-runs/hf-packed-migration-20261118/verification.json`. Check its current status before cleanup. Live Colab initially connected successfully but lacked the `HF_TOKEN` secret. Deletion readiness remains pending until both runtime checks pass.
 
 ## Storage behavior
