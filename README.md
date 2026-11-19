@@ -1,6 +1,26 @@
 # 3Deeg: EEG and 3D object explorer
 Inspect Neuro-3D / EEG-3D recordings alongside their corresponding 3D objects. The dashboard lets you rotate colored point clouds, view EEG channels and heatmaps, and compare repeated trials and recording windows.
 
+## Packed training data: Hugging Face (recommended for Colab and local runs)
+
+The private [packed-data repository](https://huggingface.co/datasets/kazumah/3deeg-packed) contains all 12 EEG subjects, object labels, video embeddings, and both point-cloud arrays. Access requires an authorized Hugging Face account. Raw archives, trained checkpoints, and experiment outputs are separate.
+
+Use the `codex/hf-packed-data` code branch. Local CPU setup (Python 3.12+):
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install numpy torch huggingface_hub
+.venv/bin/hf auth login
+export N3D_DATA="$HOME/3deeg-data/hf-packed"
+.venv/bin/python -m n3d.hub --participants sub01 --data-root "$N3D_DATA" --smoke-test
+```
+
+This downloads only the selected subjects and shared arrays, verifies SHA-256 hashes against the pinned manifest, and exercises the actual CPU loader. Use `--participants sub01 sub02` for more subjects; `--geometry point_cloud` selects the other geometry array. Reuse the same `N3D_DATA` in later terminals and training commands. Keep `N3D_RUNS` pointing at your existing checkpoint folder. The explorer's archive-based setup below is a separate workflow.
+
+For Colab, open [the updated pipeline](https://colab.research.google.com/github/kazumah1/3Deeg/blob/codex/hf-packed-data/colab/3deeg_pipeline.ipynb). Add a read-only `HF_TOKEN` in Colab Secrets and grant notebook access. Run only cells 1–2 to verify loading on CPU. Data goes to `/content/3deeg-data`; Drive is mounted for checkpoints only. Re-download selected subjects after a runtime reset. Do not use Run all for a loading check: later cells train models.
+
+The exact dataset revision is pinned in `n3d/hub.py`. A cached file with the wrong size or hash stops setup. No data or secrets belong in Git. Do not remove Drive copies until the migration record confirms both local and live Colab loading.
+
 ## Quick start
 
 The explorer and trial index require Python 3.12+ and curl. From the cloned repository:

@@ -5,36 +5,43 @@ from pathlib import Path
 md, code = nbf.v4.new_markdown_cell, nbf.v4.new_code_cell
 cells = [
     md("# 3Deeg pipeline on Colab\n"
-       "Code lives in the repo (`n3d/`); this notebook only runs it. Everything persistent "
-       "(data, checkpoints, the compiled PVCNN ops) goes to Drive under `MyDrive/3deeg/`, so a "
-       "disconnect costs at most the steps since the last checkpoint. Re-run cell 1 after every new runtime.\n\n"
-       "Order: 1 setup, 2 data (once), 3 encoder overfit check, 4 full encoder, 5 diagnostics and baselines, "
-       "6 PVCNN build check, 7 diffusion overfit check, 8 full diffusion (expensive)."),
-    md("## 1. Setup (every new runtime)"),
-    code("""from google.colab import drive
-drive.mount('/content/drive')
-import os, subprocess
-BRANCH = 'colab-pipeline'
+       "Packed data comes from the private Hugging Face cache into runtime disk. "
+       "Drive holds checkpoints and compiled ops only. Re-run setup and data cells after a new runtime. "
+       "Run cells 1–2 for a CPU loading check; later cells start training."),
+    md("## 1. Setup (every new runtime)\n"
+       "Add a read-only Hugging Face token as Colab secret `HF_TOKEN` and allow this notebook access. "
+       "Your Hugging Face account must have access to `kazumah/3deeg-packed`. Never paste tokens into cells."),
+    code("""import os, subprocess, sys
+from pathlib import Path
+from google.colab import drive, userdata
+from huggingface_hub import login
+drive.mount('/content/drive')  # checkpoints only; packed data does not use Drive
+login(token=userdata.get('HF_TOKEN'), add_to_git_credential=False)
+BRANCH = 'codex/hf-packed-data'
 os.environ.update({
-    'N3D_DATA': '/content/drive/MyDrive/3deeg/data/neuro-3d',
+    'N3D_DATA': '/content/3deeg-data',
     'N3D_RUNS': '/content/drive/MyDrive/3deeg/runs',
     'N3D_UPSTREAM': '/content/n3d_cache',
     'TORCH_EXTENSIONS_DIR': '/content/drive/MyDrive/3deeg/torch_extensions',
 })
-import torch
-if not torch.cuda.is_available():
-    print('WARNING: CPU-only runtime. Runtime > Change runtime type > GPU, then re-run this cell. '
-          'Encoder training is ~50x slower on CPU and PVCNN cannot run at all.')
-!nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
-%cd /content
-!rm -rf /content/3deeg && git clone -q -b $BRANCH https://github.com/kazumah1/3deeg /content/3deeg
-%cd /content/3deeg
-!git log --oneline -1
-!pip -q install -r requirements-colab.txt
-from n3d import viz"""),
-    md("## 2. Data (once; ~1.1 GB for sub01, kept on Drive)\n"
-       "Add participants later with `--participants sub02 sub03 ...`; already-packed files are skipped."),
-    code("!python -m n3d.download --participants sub01"),
+repo = Path('/content/3deeg-hf')
+if not repo.exists():
+    subprocess.run(['git', 'clone', '-q', '-b', BRANCH,
+                    'https://github.com/kazumah1/3Deeg.git', str(repo)], check=True)
+os.chdir(repo)
+subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '-r', 'requirements-colab.txt'], check=True)
+from n3d import viz
+print('Data:', os.environ['N3D_DATA'])"""),
+    md("## 2. Fetch and verify packed data (CPU; every new runtime)\n"
+       "About 521 MB for one subject and shared arrays; all 12 subjects plus both geometries total 4.80 GB. "
+       "The downloader pins the dataset revision, checks every selected file's SHA-256, validates arrays, "
+       "and loads a real CPU dataset item. It does not train. Add subjects to `PARTICIPANTS` as needed."),
+    code("""from n3d.hub import fetch, validate_arrays, smoke_loader
+PARTICIPANTS = ['sub01']
+root = fetch(PARTICIPANTS, data_root=os.environ['N3D_DATA'])
+print(validate_arrays(root, PARTICIPANTS))
+for subject in PARTICIPANTS:
+    print(smoke_loader(root, subject))"""),
     md("## 3. Encoder overfit check (4 categories, ~1-2 min on GPU)\n"
        "The pass condition is `trainset_shape_top1` climbing toward 1.0 (the model can memorise its own training "
        "objects). Val has only 4 objects here, so its accuracy moves in steps of 0.25 and is not the check."),
@@ -78,7 +85,7 @@ viz.show_samples('dm_sub01', file='pred_test_k5_s100.npz', k=4)"""),
 !python -m n3d.diffusion train --run pn_oracle_clip --cond-source clip --denoiser pointnet --max-steps 30000
 !python -m n3d.diffusion train --run pn_category --cond-source category --denoiser pointnet --max-steps 30000"""),
 ]
-nb = nbf.v4.new_notebook(cells=cells, metadata={"accelerator": "GPU", "colab": {"provenance": []},
+nb = nbf.v4.new_notebook(cells=cells, metadata={"colab": {"provenance": []},
                                                  "kernelspec": {"name": "python3", "display_name": "Python 3"}})
 out = Path(__file__).with_name("3deeg_pipeline.ipynb")
 nbf.write(nb, out)
