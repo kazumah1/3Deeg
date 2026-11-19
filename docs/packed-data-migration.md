@@ -17,7 +17,7 @@ The repository contains 17 data files, 4,800,155,977 bytes: 12 subject EEG NPZs,
 
 All 17 files were downloaded afresh from the pinned private repository and passed SHA-256 checks. All 12 subjects passed array validation and the actual CPU dataset loader, preserving 504/72/144 disjoint train/validation/test object splits. Both geometry choices passed. Anonymous access returned HTTP 401. Four integrity/selection tests and notebook schema/code compilation passed. No training or GPU work ran.
 
-Local evidence is saved separately at `/Users/kazuma/3deeg-runs/hf-packed-migration-20261118/verification.json`. Check its current status before cleanup. Live Colab initially connected successfully but lacked the `HF_TOKEN` secret. Deletion readiness remains pending until both runtime checks pass.
+Local evidence is saved separately at `/Users/kazuma/3deeg-runs/hf-packed-migration-20261118/verification.json`. On 2026-11-19 the user confirmed the live Colab cell ended with `COLAB LOADING PASSED; no training started`. This is user-confirmed Colab evidence; the agent could not independently re-observe the completed output because the browser encountered a Google session error. The loading checks are now complete.
 
 ## Storage behavior
 
@@ -27,4 +27,4 @@ The Drive connector cannot download the 376 MB subject NPZs because it has a 256
 
 ## Cleanup boundary
 
-Do not delete anything while verification is pending. After both checks pass, only the duplicated `data/neuro-3d/packed/` data and recoverable upstream subject ZIPs are cleanup candidates. Keep `runs/`, encoder embeddings and checkpoints, locked splits/protocols, research reports, and any unique source or processed data. Existing notebooks must use the updated HF setup before their Drive data dependency is removed. The archive-based explorer remains a separate workflow.
+Both loading checks are complete. Only the duplicated `data/neuro-3d/packed/` data and recoverable upstream subject ZIPs are cleanup candidates. Keep `runs/`, encoder embeddings and checkpoints, locked splits/protocols, research reports, and any unique source or processed data. Existing notebooks must use the updated HF setup before their Drive data dependency is removed. The archive-based explorer remains a separate workflow.
